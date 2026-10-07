@@ -1,0 +1,30 @@
+:root { --h3-web-paper: #eee9dd; --h3-web-ink: #19241f; --h3-web-accent: #b15b31; }
+body.h3-web-locked { overflow: hidden; }
+body.h3-web-locked > :not(#h3-web-login):not(script) { visibility: hidden !important; }
+#h3-web-login { position: fixed; inset: 0; z-index: 10000; display: grid; place-items: center; padding: 24px; color: var(--h3-web-ink); background: var(--h3-web-paper); font-family: "Microsoft JhengHei", "PingFang TC", sans-serif; }
+#h3-web-login[hidden] { display: none; }
+.h3-login-shell { width: min(900px, 100%); display: grid; grid-template-columns: 1fr 1.1fr; border: 1px solid #19241f33; background: #f8f5ed; box-shadow: 12px 12px 0 #19241f0d; }
+.h3-login-story { display: flex; flex-direction: column; padding: 46px 36px; background: var(--h3-web-ink); color: var(--h3-web-paper); }
+.h3-login-mark { font-family: Georgia, serif; font-size: 94px; line-height: 1; letter-spacing: -7px; border-bottom: 1px solid #eee9dd44; padding-bottom: 30px; }
+.h3-login-eyebrow { font-size: 11px; letter-spacing: 3px; margin: 30px 0 10px; color: #e0ae89; }
+.h3-login-story h1 { font-weight: 500; font-size: 29px; margin: 0 0 16px; letter-spacing: 2px; }
+.h3-login-story p { font-size: 14px; line-height: 1.9; color: #d8d6cc; margin: 0; }
+.h3-login-route { margin-top: auto; padding-top: 40px; display: flex; gap: 10px; flex-wrap: wrap; font-size: 12px; color: #c7c8be; }
+.h3-login-route span { border-top: 1px solid #eee9dd44; padding-top: 10px; }
+.h3-login-form { padding: 44px 38px; }
+.h3-login-form h2 { margin: 0 0 8px; font-size: 23px; font-weight: 600; }
+.h3-login-form > p { font-size: 13px; color: #626b60; line-height: 1.7; margin-bottom: 24px; }
+.h3-login-form label { display: block; font-size: 13px; font-weight: 600; margin: 22px 0 8px; }
+.h3-login-form input { box-sizing: border-box; width: 100%; padding: 13px 12px; background: #fffdf7; border: 1px solid #818b7b; border-radius: 0; color: var(--h3-web-ink); font: inherit; font-size: 14px; }
+.h3-login-form input:focus { outline: 2px solid var(--h3-web-accent); outline-offset: 2px; }
+.h3-login-help { display: block; margin-top: 8px; font-size: 11px; line-height: 1.7; color: #626b60; }
+.h3-login-submit { width: 100%; margin-top: 27px; padding: 14px; border: 0; color: #fff9ef; background: var(--h3-web-accent); cursor: pointer; font: inherit; font-size: 14px; font-weight: 600; }
+.h3-login-submit:disabled { opacity: .6; cursor: progress; }
+.h3-login-back { margin-top: 12px; padding: 8px 0; background: transparent; color: var(--h3-web-ink); border: 0; font: inherit; font-size: 12px; cursor: pointer; }
+.h3-login-status { margin: 16px 0 0; min-height: 24px; font-size: 12px; line-height: 1.7; color: #8c3e2e; }
+.h3-web-identity { display: inline-flex; gap: 9px; align-items: center; margin-left: 10px; max-width: 300px; font-size: 12px; }
+.h3-web-identity span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.h3-web-identity button { color: inherit; background: transparent; border: 1px solid currentColor; padding: 5px 9px; cursor: pointer; font: inherit; }
+.h3-web-managed #openGatewaySettings, .h3-web-managed #startEngine, .h3-web-managed #installMusicModels, .h3-web-managed #installVoiceModels { display: none !important; }
+@media(max-width: 650px) { .h3-login-shell { grid-template-columns: 1fr; } .h3-login-story { padding: 22px 26px; } .h3-login-mark { font-size: 45px; padding-bottom: 12px; letter-spacing: -3px; } .h3-login-eyebrow { margin-top: 17px; } .h3-login-story h1 { font-size: 22px; margin-bottom: 8px; } .h3-login-route { display: none; } .h3-login-form { padding: 24px 26px; } #h3-web-login { overflow-y: auto; place-items: start center; padding: 16px; } }
+@media(prefers-reduced-motion: reduce) { #h3-web-login * { transition: none !important; animation: none !important; } }

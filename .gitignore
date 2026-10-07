@@ -1,0 +1,10 @@
+.site-*/
+.DS_Store
+Thumbs.db
+node_modules/
+*.log
+**/config.json
+**/data/
+**/__pycache__/
+*.pem
+*.key

@@ -1,0 +1,47 @@
+diff --git a/H3Studio/app.py b/H3Studio/app.py
+index 4478fbc..6dab96c 100644
+--- a/H3Studio/app.py
++++ b/H3Studio/app.py
+@@ -7,6 +7,7 @@ import io
+ import json
+ import math
+ import mimetypes
++import os
+ from fractions import Fraction
+ import re
+ import uuid
+@@ -71,11 +72,11 @@ from studio_startup import plan_startup, probe_studio
+ 
+ APP_DIR = Path(__file__).resolve().parent
+ STATIC_DIR = APP_DIR / "static"
+-DATA_DIR = APP_DIR / "data"
++DATA_DIR = Path(os.environ.get("H3_STUDIO_DATA_DIR", str(APP_DIR / "data"))).resolve()
+ ASSET_DIR = DATA_DIR / "assets"
+ JOB_DIR = DATA_DIR / "jobs"
+ OUTPUT_DIR = DATA_DIR / "outputs"
+-CONFIG_PATH = APP_DIR / "config.json"
++CONFIG_PATH = Path(os.environ.get("H3_STUDIO_CONFIG_PATH", str(APP_DIR / "config.json"))).resolve()
+ SAFE_ID = re.compile(r"^[a-f0-9]{32}$")
+ MAX_JOB_NAME_LENGTH = 80
+ INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+diff --git a/H3Studio/video_editor.py b/H3Studio/video_editor.py
+index 75246da..d785624 100644
+--- a/H3Studio/video_editor.py
++++ b/H3Studio/video_editor.py
+@@ -96,11 +96,14 @@ def check_orientation(frame, stream):
+         rotation = float(stream.metadata.get("rotate", "0"))
+     except (ValueError, TypeError):
+         rotation = 1.0
+-    matrix = any(item.type.name == "DISPLAYMATRIX" for item in frame.side_data)
++    # New PyAV containers iterate mapping keys; older ones iterate SideData.
++    side_data = frame.side_data.values() if hasattr(frame.side_data, "values") else frame.side_data
++    matrix = any(item.type.name == "DISPLAYMATRIX" for item in side_data)
+     if rotation % 360 or frame.rotation or matrix:
+         raise EditorError("這段影片含旋轉／顯示矩陣，請先轉成已轉正的 MP4 再匯入。")
+     aspect = stream.sample_aspect_ratio
+-    if aspect is not None and aspect != 1:
++    # FFmpeg/PyAV represents an unspecified pixel aspect ratio as 0/1.
++    if aspect is not None and aspect > 0 and aspect != 1:
+         raise EditorError("這段影片使用非方形像素，請先轉成方形像素 MP4 再匯入。")
+ 
+ 
