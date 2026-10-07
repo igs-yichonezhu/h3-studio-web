@@ -2,7 +2,7 @@
 
 H3 Studio 的 GitHub Pages 網頁介面。公司主機執行完整 Studio API、GPU 生成和剪輯匯出；瀏覽器只載入操作介面。
 
-網站發布後網址：`https://yichonezhu.github.io/h3-studio-web/`
+網站發布後網址：`https://igs-yichonezhu.github.io/h3-studio-web/`
 
 ## 同事使用方式
 
@@ -35,7 +35,7 @@ H3 Studio 的 GitHub Pages 網頁介面。公司主機執行完整 Studio API、
 python H3Studio/web_server.py --cert C:/certs/studio.crt --key C:/certs/studio.key
 ```
 
-憑證與私人設定不要放入 Repo。不同的網站來源需由管理者以 `--origin https://example.company` 指定；預設僅允許 `https://yichonezhu.github.io`。
+憑證與私人設定不要放入 Repo。不同的網站來源需由管理者以 `--origin https://example.company` 指定；預設僅允許 `https://igs-yichonezhu.github.io`。
 
 ## 瀏覽器連線
 
@@ -61,7 +61,7 @@ python H3Studio/web_server.py --cert C:/certs/studio.crt --key C:/certs/studio.k
 
 在 Repo Settings → Pages 將 Source 設為 **GitHub Actions**。推送 main 後，`.github/workflows/pages.yml` 會檢查靜態檔案並發布網站。
 
-首次發布也可在本 Repo 執行 `./publish_github.ps1`：需要先以 `gh auth login` 登入 yichonezhu，腳本會建立公開 Repo、設定 Pages，再推送已提交的 main。此 Repo 的程式碼與介面為公開，個人金鑰、設定與作品僅保存在公司主機。
+首次發布也可在本 Repo 執行 `./publish_github.ps1`：需要先以 `gh auth login` 登入 igs-yichonezhu，腳本會建立公開 Repo、設定 Pages，再推送已提交的 main。此 Repo 的程式碼與介面為公開，個人金鑰、設定與作品僅保存在公司主機。
 
 本版驗證包含 64 項 Python 測試與 7 項前端測試，以及瀏覽器 MP4 上傳、跨來源影片載入及專案儲存。使用真實 CPU 剪輯匯出，未執行公司 GPU 生成或跨電腦網路驗收。
 

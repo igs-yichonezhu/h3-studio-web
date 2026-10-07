@@ -1,11 +1,11 @@
 $ErrorActionPreference = 'Stop'
 Set-Location -LiteralPath $PSScriptRoot
 & gh auth status
-if ($LASTEXITCODE -ne 0) { throw 'Run gh auth login with yichonezhu, then run this script again.' }
+if ($LASTEXITCODE -ne 0) { throw 'Run gh auth login with igs-yichonezhu, then run this script again.' }
 $taskLogin = (& gh api user --jq .login).Trim()
-if ($LASTEXITCODE -ne 0 -or $taskLogin -ne 'yichonezhu') { throw 'Please sign in as yichonezhu before publishing.' }
+if ($LASTEXITCODE -ne 0 -or $taskLogin -ne 'igs-yichonezhu') { throw 'Please sign in as igs-yichonezhu before publishing.' }
 if (& git status --porcelain) { throw 'Review and commit local changes before publishing.' }
-$taskRepo = 'yichonezhu/h3-studio-web'
+$taskRepo = 'igs-yichonezhu/h3-studio-web'
 & gh repo view $taskRepo --json nameWithOwner 2>$null
 if ($LASTEXITCODE -ne 0) {
     & gh repo create $taskRepo --public --description 'H3 Studio web interface for company LAN access' --source . --remote origin
@@ -13,8 +13,8 @@ if ($LASTEXITCODE -ne 0) {
 }
 $taskRemote = & git remote get-url origin 2>$null
 if ($LASTEXITCODE -ne 0) {
-    & git remote add origin 'https://github.com/yichonezhu/h3-studio-web.git'
-} elseif ($taskRemote -notin @('https://github.com/yichonezhu/h3-studio-web.git', 'git@github.com:yichonezhu/h3-studio-web.git')) {
+    & git remote add origin 'https://github.com/igs-yichonezhu/h3-studio-web.git'
+} elseif ($taskRemote -notin @('https://github.com/igs-yichonezhu/h3-studio-web.git', 'git@github.com:igs-yichonezhu/h3-studio-web.git')) {
     throw 'The origin remote does not match the intended GitHub repository.'
 }
 & gh auth setup-git
@@ -30,4 +30,4 @@ if ($LASTEXITCODE -ne 0) {
 if ($LASTEXITCODE -ne 0) { throw 'Could not start the Pages workflow. Check Actions permissions.' }
 Write-Host 'Repository pushed. Check deployment:'
 & gh run list --repo $taskRepo --workflow pages.yml --limit 1
-Write-Host 'Website after successful deployment: https://yichonezhu.github.io/h3-studio-web/'
+Write-Host 'Website after successful deployment: https://igs-yichonezhu.github.io/h3-studio-web/'

@@ -504,7 +504,7 @@ def main():
         tls.minimum_version = ssl.TLSVersion.TLSv1_2
         tls.load_cert_chain(arguments.cert, arguments.key)
     server = StudioWebServer(arguments.gateway_data, arguments.worker_root, arguments.gateway_url,
-                             arguments.origin or ["https://yichonezhu.github.io"])
+                             arguments.origin or ["https://igs-yichonezhu.github.io"])
     print("H3 Studio Web API: company LAN port", arguments.port, flush=True)
     print("Allowed web origins:", ", ".join(sorted(server.origins)), flush=True)
     web.run_app(server.create_app(), host=arguments.host, port=arguments.port,

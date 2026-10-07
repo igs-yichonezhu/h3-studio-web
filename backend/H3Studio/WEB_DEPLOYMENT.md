@@ -1,6 +1,6 @@
 # GitHub Pages 與公司內網部署
 
-網頁 Repo: `yichonezhu/h3-studio-web`，Pages 網址發布後為 `https://yichonezhu.github.io/h3-studio-web/`。
+網頁 Repo: `igs-yichonezhu/h3-studio-web`，Pages 網址發布後為 `https://igs-yichonezhu.github.io/h3-studio-web/`。
 
 主機先維持 H3 Studio、ComfyUI 與共享 Gateway（8190）運作，再執行專案根目錄 `start_h3_web_server.bat`。同事在公司內網瀏覽網頁，填入 `http://<主機內網 IP>:8795` 及自己原有的共享引擎金鑰。這個 8795 入口提供完整 Studio API；不要將網頁直接連到 8190 或 8188。
 
@@ -8,7 +8,7 @@
 
 管理員 PowerShell 可執行 `configure_h3_web_firewall.ps1`，只對 Domain/Private 網路同子網路開放 TCP 8795。入口也拒絕公開 IP 來源。公司 Wi-Fi 的不同 VLAN 或端點防護可能需要 IT 調整指定來源規則。
 
-預設網站 Origin 為 `https://yichonezhu.github.io`。本機預覽可額外指定 `--origin http://127.0.0.1:8876`；部署時不需保留測試 Origin。可信 HTTPS 憑證透過 `--cert` 與 `--key` 指定；不會自動停用憑證驗證。
+預設網站 Origin 為 `https://igs-yichonezhu.github.io`。本機預覽可額外指定 `--origin http://127.0.0.1:8876`；部署時不需保留測試 Origin。可信 HTTPS 憑證透過 `--cert` 與 `--key` 指定；不會自動停用憑證驗證。
 
 金鑰輪替及停用沿用管理主機的「共享引擎」。入口每次請求讀取最新使用者設定，撤銷 session 和媒體票證立即生效。Web 一般使用者無權變更引擎網址、Gateway、模型或安裝程式。
 
