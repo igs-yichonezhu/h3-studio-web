@@ -209,8 +209,10 @@ class WorkerPool:
 
 class StudioWebServer:
     def __init__(self, gateway_data: Path, worker_root: Path, gateway_url: str, origins,
-                 *, pool=None, session_seconds=SESSION_SECONDS):
+                 *, pool=None, session_seconds=SESSION_SECONDS, remote_auth=False):
         self.gateway_data = gateway_data.resolve()
+        self.gateway_url = origin_value(gateway_url)
+        self.remote_auth = remote_auth
         self.pool = pool or WorkerPool(worker_root, gateway_url)
         self.origins = {origin_value(value) for value in origins}
         self.sessions = {}
@@ -219,6 +221,7 @@ class StudioWebServer:
         self.session_seconds = session_seconds
         self.attempts = defaultdict(deque)
         self.client = None
+        self.auth_client = None
 
     def users(self):
         # Never trust the cached config of a previous GatewayStore instance.
@@ -226,7 +229,45 @@ class StudioWebServer:
             return None
         return GatewayStore(self.gateway_data)
 
-    def active(self, session):
+    async def remote_key_valid(self, token, *, check_protection=False):
+        if not isinstance(token, str) or not re.fullmatch(r'h3g_[A-Za-z0-9_-]{10,240}', token):
+            return False
+        target = self.gateway_url + '/queue'
+        timeout = aiohttp.ClientTimeout(total=8)
+        if check_protection:
+            async with self.auth_client.get(target, timeout=timeout, allow_redirects=False) as response:
+                if response.status not in {401, 403}:
+                    raise web.HTTPServiceUnavailable(reason='Configured remote Gateway is not authenticated')
+        async with self.auth_client.get(target, headers={'Authorization': 'Bearer ' + token},
+                                   timeout=timeout, allow_redirects=False) as response:
+            if response.status in {401, 403}:
+                return False
+            if response.status != 200:
+                raise web.HTTPServiceUnavailable(reason='Remote Gateway unavailable')
+            try:
+                if response.content_type != 'application/json':
+                    raise ValueError('Not JSON')
+                body, size = [], 0
+                async for chunk in response.content.iter_chunked(65536):
+                    size += len(chunk)
+                    if size > 2 * 1024**2:
+                        raise ValueError('Queue metadata too large')
+                    body.append(chunk)
+                value = json.loads(b''.join(body))
+            except (ValueError, aiohttp.ContentTypeError):
+                raise web.HTTPServiceUnavailable(reason='Invalid remote Gateway response') from None
+            if not isinstance(value, dict) or not isinstance(value.get('running'), list) or not isinstance(value.get('pending'), list):
+                raise web.HTTPServiceUnavailable(reason='Invalid remote Gateway queue')
+            return True
+
+    async def active(self, session):
+        if session['expires'] <= time.time():
+            return False
+        if self.remote_auth:
+            try:
+                return await self.remote_key_valid(session.get('gateway_token'))
+            except (aiohttp.ClientError, asyncio.TimeoutError):
+                raise web.HTTPServiceUnavailable(reason='Remote Gateway temporarily unavailable') from None
         store = self.users()
         if not store or session["expires"] <= time.time():
             return False
@@ -234,12 +275,12 @@ class StudioWebServer:
                    and hmac.compare_digest(str(user.get("token_hash", "")), session["fingerprint"])
                    for user in store.config.get("users", []))
 
-    def bearer_session(self, request):
+    async def bearer_session(self, request):
         header = request.headers.get("Authorization", "")
         if not header.lower().startswith("bearer "):
             return None
         session = self.sessions.get(hashlib.sha256(header[7:].strip().encode()).hexdigest())
-        return session if session and self.active(session) else None
+        return session if session and await self.active(session) else None
 
     def ticket(self, session, path):
         if not MEDIA_ROUTE.fullmatch(path):
@@ -251,7 +292,7 @@ class StudioWebServer:
         signature = hmac.new(self.signing_key, encoded.encode(), hashlib.sha256).hexdigest()
         return encoded + "." + signature
 
-    def media_session(self, request, path):
+    async def media_session(self, request, path):
         if request.method not in {"GET", "HEAD"} or not MEDIA_ROUTE.fullmatch(path):
             return None
         if set(request.query) - {"ticket", "download", "original", "v"}:
@@ -272,7 +313,7 @@ class StudioWebServer:
             session = self.session_ids.get(payload["s"])
             if payload["p"] != path or payload["e"] <= time.time():
                 return None
-            return session if session and self.active(session) else None
+            return session if session and await self.active(session) else None
         except (ValueError, KeyError, TypeError, json.JSONDecodeError):
             return None
 
@@ -346,9 +387,12 @@ class StudioWebServer:
 
         async def start(_):
             self.client = aiohttp.ClientSession(auto_decompress=False, timeout=aiohttp.ClientTimeout(total=None, sock_connect=15))
+            self.auth_client = aiohttp.ClientSession(cookie_jar=aiohttp.DummyCookieJar(),
+                                                    timeout=aiohttp.ClientTimeout(total=8, sock_connect=3, sock_read=8))
         async def close(_):
             await self.pool.close()
             await self.client.close()
+            await self.auth_client.close()
         application.on_startup.append(start)
         application.on_cleanup.append(close)
         return application
@@ -373,8 +417,17 @@ class StudioWebServer:
             token = str(payload.get("key", "")).strip()
         except (ValueError, AttributeError):
             return error(400, "請輸入個人金鑰。")
-        store = self.users()
-        user = store.authenticate(token) if store and len(token) < 256 else None
+        if self.remote_auth:
+            try:
+                valid = await self.remote_key_valid(token, check_protection=True)
+            except (aiohttp.ClientError, asyncio.TimeoutError, web.HTTPException):
+                return error(503, '無法驗證遠端 GPU 共享引擎，請確認主機運作與 Gateway 網址。')
+            fingerprint = hashlib.sha256(token.encode()).hexdigest()
+            identity = hashlib.sha256(json.dumps([self.gateway_url, token], separators=(',', ':')).encode()).hexdigest()[:16]
+            user = {'id': identity, 'name': 'GPU 使用者', 'token_hash': fingerprint} if valid else None
+        else:
+            store = self.users()
+            user = store.authenticate(token) if store and len(token) < 256 else None
         if not user:
             return error(401, "個人金鑰無效、已換發或已停用。")
         try:
@@ -390,13 +443,15 @@ class StudioWebServer:
         bearer = secrets.token_urlsafe(32)
         session = {"id": secrets.token_hex(16), "user_id": user["id"], "name": user["name"],
                    "fingerprint": str(user["token_hash"]), "expires": int(now) + self.session_seconds}
+        if self.remote_auth:
+            session['gateway_token'] = token
         self.sessions[hashlib.sha256(bearer.encode()).hexdigest()] = session
         self.session_ids[session["id"]] = session
         return web.json_response({"token": bearer, "user": {"id": user["id"], "name": user["name"]},
                                   "expires": session["expires"]})
 
     async def session(self, request):
-        session = self.bearer_session(request)
+        session = await self.bearer_session(request)
         if not session:
             return error(401, "登入已失效，請重新輸入個人金鑰。")
         if not self.pool.get(session["user_id"]):
@@ -404,15 +459,17 @@ class StudioWebServer:
         return web.json_response({"user": {"id": session["user_id"], "name": session["name"]}, "expires": session["expires"]})
 
     async def logout(self, request):
-        session = self.bearer_session(request)
+        header = request.headers.get('Authorization', '')
+        digest = hashlib.sha256(header[7:].strip().encode()).hexdigest() if header.lower().startswith('bearer ') else None
+        # Logout remains available when the remote GPU is offline or revoked.
+        session = self.sessions.get(digest)
         if session:
             self.session_ids.pop(session["id"], None)
-            header = request.headers["Authorization"][7:].strip()
-            self.sessions.pop(hashlib.sha256(header.encode()).hexdigest(), None)
+            self.sessions.pop(digest, None)
         return web.json_response({"logged_out": True})
 
     async def refresh_tickets(self, request):
-        session = self.bearer_session(request)
+        session = await self.bearer_session(request)
         if not session:
             return error(401, "登入已失效。")
         if request.content_length and request.content_length > 1024 * 1024:
@@ -431,7 +488,7 @@ class StudioWebServer:
             path = clean_api_path(request.raw_path)
         except ValueError:
             return error(404, "找不到此網頁 API。")
-        session = self.bearer_session(request) or self.media_session(request, path)
+        session = await self.bearer_session(request) or await self.media_session(request, path)
         if not session:
             return error(401, "請先登入 Studio。")
         if not route_allowed(request.method, path):
@@ -490,11 +547,36 @@ def main():
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8795)
     parser.add_argument("--gateway-url", default="http://127.0.0.1:8190")
+    parser.add_argument('--remote-auth', action='store_true', help='Authenticate personal keys against the configured remote Gateway')
+    parser.add_argument('--local-auth', action='store_false', dest='remote_auth', help='Authenticate with this computer GatewayStore')
+    parser.add_argument('--settings', type=Path, default=APP_DIR / 'data' / 'web_server.settings.json')
     parser.add_argument("--gateway-data", type=Path, default=APP_DIR / "data")
     parser.add_argument("--worker-root", type=Path, default=APP_DIR / "data" / "web_users")
     parser.add_argument("--origin", action="append", default=None)
     parser.add_argument("--cert", type=Path)
     parser.add_argument("--key", type=Path)
+    preview, _ = parser.parse_known_args()
+    if preview.settings.is_file():
+        try:
+            settings = json.loads(preview.settings.read_text(encoding='utf-8'))
+            if not isinstance(settings, dict) or set(settings) - {'gateway_url', 'remote_auth', 'origins'}:
+                raise ValueError('Unknown deployment settings')
+            defaults = {}
+            if 'gateway_url' in settings:
+                if not isinstance(settings['gateway_url'], str):
+                    raise ValueError('gateway_url must be a URL string')
+                defaults['gateway_url'] = settings['gateway_url']
+            if 'remote_auth' in settings:
+                if type(settings['remote_auth']) is not bool:
+                    raise ValueError('remote_auth must be boolean')
+                defaults['remote_auth'] = settings['remote_auth']
+            if 'origins' in settings:
+                if not isinstance(settings['origins'], list) or not settings['origins']:
+                    raise ValueError('origins must be a non-empty list')
+                defaults['origin'] = [origin_value(value) for value in settings['origins']]
+            parser.set_defaults(**defaults)
+        except (ValueError, TypeError, AttributeError):
+            parser.error('Invalid private deployment settings file')
     arguments = parser.parse_args()
     if bool(arguments.cert) != bool(arguments.key):
         parser.error("--cert and --key must be provided together")
@@ -504,7 +586,7 @@ def main():
         tls.minimum_version = ssl.TLSVersion.TLSv1_2
         tls.load_cert_chain(arguments.cert, arguments.key)
     server = StudioWebServer(arguments.gateway_data, arguments.worker_root, arguments.gateway_url,
-                             arguments.origin or ["https://igs-yichonezhu.github.io"])
+                             arguments.origin or ["https://igs-yichonezhu.github.io"], remote_auth=arguments.remote_auth)
     print("H3 Studio Web API: company LAN port", arguments.port, flush=True)
     print("Allowed web origins:", ", ".join(sorted(server.origins)), flush=True)
     web.run_app(server.create_app(), host=arguments.host, port=arguments.port,

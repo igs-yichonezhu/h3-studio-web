@@ -21,4 +21,9 @@ foreach ($taskName in @('web_server.py', 'web_worker.py', 'WEB_DEPLOYMENT.md')) 
 foreach ($taskName in @('start_h3_web_server.bat', 'configure_h3_web_firewall.ps1')) {
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot $taskName) -Destination (Join-Path $taskRoot $taskName) -Force
 }
+$taskTestDestination = Join-Path $taskRoot 'H3Studio/tests'
+New-Item -ItemType Directory -Path $taskTestDestination -Force | Out-Null
+foreach ($taskName in @('test_web_server.py', 'test_web_remote_auth.py', 'test_web_workers.py')) {
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot "H3Studio/tests/$taskName") -Destination (Join-Path $taskTestDestination $taskName) -Force
+}
 Write-Host 'Company backend installed. Keep the host Studio/Gateway running, then start start_h3_web_server.bat.'

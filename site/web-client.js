@@ -174,7 +174,11 @@
     if (explicitSession?.token) headers.set('Authorization', `Bearer ${explicitSession.token}`);
     const response = await nativeFetch(explicitSession.server + path, { ...options, headers, credentials: 'omit', mode: 'cors', referrerPolicy: 'no-referrer' });
     const data = await response.json();
-    if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+    if (!response.ok) {
+      const error = new Error(data.error || `HTTP ${response.status}`);
+      error.status = response.status;
+      throw error;
+    }
     return data;
   }
   async function activate(value) {
@@ -233,7 +237,7 @@
       const result = await webAPI('/web/media-tickets', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({paths}) });
       acceptTickets(result.tickets);
       updateMediaSources();
-    } catch { showLogin('連線已失效，請重新登入。'); }
+    } catch (error) { if (error.status === 401) showLogin('連線已失效，請重新登入。'); }
     finally { refreshing = false; }
   }
   function updateMediaSources() {
@@ -291,9 +295,9 @@
       previous.server = normalizeServer(previous.server);
       const state = await webAPI('/web/session', {}, previous);
       await activate({...previous, ...state});
-    } catch {
-      window.sessionStorage.removeItem(authKey);
-      showLogin('請重新輸入金鑰以連線公司 Studio。');
+    } catch (error) {
+      if (error.status === 401) window.sessionStorage.removeItem(authKey);
+      showLogin(error.status === 503 ? 'GPU 主機暫時無法連線，請稍後重新整理。' : '請重新輸入金鑰以連線公司 Studio。');
     }
   })();
 })();

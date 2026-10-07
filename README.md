@@ -46,6 +46,7 @@ python H3Studio/web_server.py --cert C:/certs/studio.crt --key C:/certs/studio.k
 ## 資料與登入
 
 - 登入前先檢查 Studio Web 健康資訊，並提示誤填 8188／8190；個人長期金鑰只送往填入的公司主機，不寫入瀏覽器儲存，也不送 GitHub。
+- GPU Gateway 在另一台電腦時，以私人 web_server.settings.json 設定 gateway_url 和 remote_auth，詳細設定與金鑰輪替資料移轉方式見 backend/H3Studio/WEB_DEPLOYMENT.md。Web 網址仍使用 Web 主機的 8795。
 - 瀏覽器分頁保存最長 8 小時的登入 session；登出、金鑰換發或停用即失效。
 - 每位同事有獨立的 Studio 工作程序、素材、生成歷史、圖片、語音與剪輯專案。
 - 圖片、音訊、影片與下載採 30 分鐘的讀取票證，綁定 session、使用者與指定路徑；登入期間自動更新。票證不可執行生成或修改資料。
@@ -63,6 +64,6 @@ python H3Studio/web_server.py --cert C:/certs/studio.crt --key C:/certs/studio.k
 
 首次發布也可在本 Repo 執行 `./publish_github.ps1`：需要先以 `gh auth login` 登入 igs-yichonezhu，腳本會建立公開 Repo、設定 Pages，再推送已提交的 main。此 Repo 的程式碼與介面為公開，個人金鑰、設定與作品僅保存在公司主機。
 
-本版驗證包含 64 項 Python 測試與 9 項前端測試，以及瀏覽器 MP4 上傳、跨來源影片載入及專案儲存。使用真實 CPU 剪輯匯出，未執行公司 GPU 生成或跨電腦網路驗收。
+本版驗證包含 64 項既有 Python 回歸測試、4 項遠端驗證測試與 10 項前端測試，以及瀏覽器 MP4 上傳、跨來源影片載入及專案儲存。使用真實 CPU 剪輯匯出，未執行公司 GPU 生成或跨電腦網路驗收。
 
 前端由既有 H3 Studio 介面產生。更新主機專案後執行其 `web_deploy/build.mjs` 重新產生 site/；建置會保留上一份輸出於 Git 忽略的 `.site-previous-*`，避免舊檔混入發布。

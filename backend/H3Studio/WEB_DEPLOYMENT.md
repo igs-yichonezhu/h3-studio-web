@@ -6,6 +6,10 @@
 
 現有本機介面與作品不會搬動。Web 使用者新增資料在 `H3Studio/data/web_users/<Gateway使用者ID>/data/`，個人連線設定在該使用者自己的 `config.json`。工作程序只監聽 loopback，所有請求另需入口生成的內部隨機 token。
 
+若 GPU Gateway 位於另一台電腦，可使用 `--gateway-url http://<GPU內網IP>:8190 --remote-auth`。也可在主機私人檔案 `H3Studio/data/web_server.settings.json` 設定 `gateway_url`、`remote_auth: true` 及 `origins`，之後雙擊原啟動腳本會沿用設定；不要將此檔案或金鑰提交至 Repo。Web 主機網址仍填 Web 電腦的 8795，個人金鑰則使用該遠端 GPU Gateway 核發的金鑰。
+
+遠端模式在登入及後續 API／媒體請求重新向 GPU Gateway 驗證，停用後的新請求立即拒絕；已開始的下載不會中途終止。GPU 暫時離線會回 503，保留 session 供重試。遠端 Gateway 未提供穩定使用者 ID，因此以 Gateway 與金鑰建立獨立資料空間；同一金鑰重登會保留資料，換發金鑰會建立新空間。請在換發前下載完整剪輯專案備份，或由管理者核對身份後移轉舊工作程序的私人 data 目錄。本機驗證模式仍沿用 Gateway 使用者 ID，換發金鑰不會建立新空間。
+
 管理員 PowerShell 可執行 `configure_h3_web_firewall.ps1`，只對 Domain/Private 網路同子網路開放 TCP 8795。入口也拒絕公開 IP 來源。公司 Wi-Fi 的不同 VLAN 或端點防護可能需要 IT 調整指定來源規則。
 
 預設網站 Origin 為 `https://igs-yichonezhu.github.io`。本機預覽可額外指定 `--origin http://127.0.0.1:8876`；部署時不需保留測試 Origin。可信 HTTPS 憑證透過 `--cert` 與 `--key` 指定；不會自動停用憑證驗證。
