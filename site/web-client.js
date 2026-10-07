@@ -20,6 +20,8 @@
     const url = new URL(value);
     if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash || !['', '/'].includes(url.pathname))
       throw new Error('請輸入完整公司主機網址，例如 http://192.168.1.20:8795。');
+    if (['8188', '8190'].includes(url.port))
+      throw new Error('這是引擎／共享 Gateway 網址。請使用 Studio Web 主機網址，預設連接埠為 8795。');
     return url.origin;
   }
   function readSession() { try { return JSON.parse(window.sessionStorage.getItem(authKey)); } catch { return null; } }
@@ -155,6 +157,7 @@
   const keyInput = login.querySelector('#h3-web-key');
   const status = login.querySelector('[role="status"]');
   try { serverInput.value = window.localStorage.getItem(serverKey) || ''; } catch {}
+  serverInput.nextElementSibling.textContent = '請連接公司內網，填入 Studio Web 網址（預設 8795）。共享引擎 8190 和 ComfyUI 8188 無法直接使用。';
   function showLogin(message = '') {
     document.body.classList.add('h3-web-locked');
     login.hidden = false;
@@ -260,6 +263,10 @@
     button.disabled = true; status.textContent = '正在驗證金鑰並開啟你的工作室…';
     try {
       const server = normalizeServer(serverInput.value.trim());
+      // Check the endpoint before transmitting a personal key.
+      const health = await webAPI('/web/health', {signal: AbortSignal.timeout(8000)}, {server});
+      if (health.service !== 'h3-studio-web')
+        throw new Error('指定網址不是 Studio Web 入口。請確認主機網址與連接埠，預設為 8795。');
       const result = await webAPI('/web/login', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({key: keyInput.value.trim()}) }, {server});
       keyInput.value = '';
       if (loaded && session && (server !== session.server || result.user.id !== session.user.id)) {
@@ -271,7 +278,9 @@
       tickets.clear();
       await activate({...result, server});
     } catch (error) {
-      status.textContent = error instanceof TypeError ? '無法連線公司主機。請確認內網、主機網址和瀏覽器的區域網路存取權限；也可請管理者提供 HTTPS 網址。' : error.message;
+      status.textContent = error instanceof TypeError ? '無法連線公司主機。請確認使用 Studio Web 網址（8795）、公司內網及瀏覽器區域網路權限；同事電腦連線也需要主機防火牆開放。' :
+        error.name === 'TimeoutError' ? '公司主機連線逾時。請確認內網、主機網址與 8795 防火牆規則。' :
+        error instanceof SyntaxError ? '指定網址沒有提供 Studio Web API。請確認使用管理者提供的 Web 主機網址（預設 8795）。' : error.message;
     } finally { button.disabled = false; }
   });
   document.addEventListener('visibilitychange', () => { if (!document.hidden) refreshMedia(); });
