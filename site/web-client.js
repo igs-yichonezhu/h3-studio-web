@@ -5,14 +5,17 @@
   const nativeXHR = window.XMLHttpRequest;
   const repoRoot = new URL('./', location.href);
   const authKey = `h3-web-auth:${repoRoot.pathname}:v1`;
+  const sharedAuthKey = `h3-web-shared-auth:${repoRoot.pathname}:v1`;
+  const sharedProtocolKey = `h3-web-shared-auth-enabled:${repoRoot.pathname}:v1`;
   const serverKey = `h3-web-server:${repoRoot.pathname}:v1`;
-  const gatewayKey = `h3-web-gateway:${repoRoot.pathname}:v1`;
   let deployment = {};
   try { deployment = JSON.parse(document.getElementById('h3-web-deployment')?.textContent || '{}'); } catch {}
   const tickets = new Map();
   let session = null;
   let loaded = false;
   let refreshing = false;
+  let authBlocked = false;
+  let authEpoch = 0;
   const missingTickets = new Set();
   let missingTimer = null;
   const mediaReferences = new Set();
@@ -28,14 +31,50 @@
     return url.origin;
   }
   function normalizeGateway(value) {
-    const url = new URL(value);
+    if (!value) throw new Error('請輸入你要連線的 GPU Gateway 網址與該台電腦的金鑰。');
+    let url;
+    try { url = new URL(value); } catch { throw new Error('請輸入完整 GPU Gateway 網址，例如 http://192.168.1.20:8190。'); }
     if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash || !['', '/'].includes(url.pathname))
       throw new Error('請輸入完整 GPU Gateway 網址，例如 http://192.168.1.20:8190。');
     if (url.port === '8188') throw new Error('請使用有金鑰保護的共享 Gateway 網址（預設 8190），不是 ComfyUI 8188。');
     return url.origin;
   }
-  function readSession() { try { return JSON.parse(window.sessionStorage.getItem(authKey)); } catch { return null; } }
-  function saveSession(value) { window.sessionStorage.setItem(authKey, JSON.stringify(value)); }
+  function sharedSession() { try { return JSON.parse(window.localStorage.getItem(sharedAuthKey)); } catch { return null; } }
+  function readSession() {
+    const shared = sharedSession();
+    if (shared) return shared;
+    try { if (window.localStorage.getItem(sharedProtocolKey)) return null; } catch { return null; }
+    try { return JSON.parse(window.sessionStorage.getItem(authKey)); } catch { return null; }
+  }
+  function editSharedAuth(action) {
+    return navigator.locks?.request ? navigator.locks.request(sharedAuthKey, action) : Promise.resolve().then(action);
+  }
+  async function saveSession(value, expectedShared, legacy = false) {
+    const serialized = JSON.stringify(value);
+    // Only the short-lived Web bearer is shared. The personal GPU key is never saved.
+    await editSharedAuth(() => {
+      const current = sharedSession();
+      if ((!sameAuth(current, expectedShared) && !sameAuth(current, value)) ||
+          (legacy && !current && window.localStorage.getItem(sharedProtocolKey)))
+        throw new Error('登入狀態已在其他分頁變更，請重新整理。');
+      try {
+        window.localStorage.setItem(sharedProtocolKey, '1');
+        if (window.localStorage.getItem(sharedAuthKey) !== serialized) window.localStorage.setItem(sharedAuthKey, serialized);
+      } catch { throw new Error('瀏覽器無法保存登入狀態，請允許此網站儲存資料後重試。'); }
+    });
+    try { window.sessionStorage.removeItem(authKey); } catch {}
+  }
+  async function forgetSession(value) {
+    try {
+      await editSharedAuth(() => {
+        window.localStorage.setItem(sharedProtocolKey, '1');
+        const current = sharedSession();
+        if (!value || sameAuth(current, value)) window.localStorage.removeItem(sharedAuthKey);
+      });
+    } catch { /* Server revocation remains available when browser storage is unavailable. */ }
+    try { window.sessionStorage.removeItem(authKey); } catch {}
+  }
+  function sameAuth(a, b) { return a?.server === b?.server && a?.token === b?.token; }
   function storageScope(storage) {
     function prefix() {
       if (!session?.user?.id) throw new Error('請先登入。');
@@ -87,13 +126,17 @@
   }
   async function loadMissingTickets() {
     missingTimer = null;
-    if (!session || !missingTickets.size) return;
+    if (!session || authBlocked || !missingTickets.size) return;
+    const requestSession = session, epoch = authEpoch;
     const paths = [...missingTickets]; missingTickets.clear();
     try {
-      const value = await webAPI('/web/media-tickets', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({paths})});
+      const value = await webAPI('/web/media-tickets', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({paths})}, requestSession);
+      if (epoch !== authEpoch || authBlocked) return;
       acceptTickets(value.tickets);
       updateMediaSources();
-    } catch { /* Normal API refresh or a new login will retry. */ }
+    } catch (error) {
+      if (error.status === 401 && epoch === authEpoch) { forgetSession(requestSession); lockAuth('連線已失效，請重新登入。'); }
+    }
   }
   function rewriteJSON(value, field = '') {
     if (typeof value === 'string') return /(?:^url$|_url$)/.test(field) && apiPath(value) ? url(value) : value;
@@ -104,37 +147,41 @@
   async function fetchAPI(value, options = {}) {
     const target = apiPath(typeof value === 'string' ? value : value?.url);
     if (!target || !session) throw new Error('此請求不是目前公司的 Studio API。');
+    if (authBlocked) throw new Error('已登出，請重新登入。');
+    const requestSession = session, epoch = authEpoch;
     target.searchParams.delete('ticket');
     const headers = new Headers(options.headers || (value instanceof Request ? value.headers : undefined));
-    headers.set('Authorization', `Bearer ${session.token}`);
+    headers.set('Authorization', `Bearer ${requestSession.token}`);
     const response = await nativeFetch(target.href, { ...options, headers, credentials: 'omit', mode: 'cors', referrerPolicy: 'no-referrer' });
     const json = response.json.bind(response);
     response.json = async () => {
       const value = await json();
       if (value && Object.prototype.hasOwnProperty.call(value, '__h3_web_payload')) {
-        acceptTickets(value.__h3_web_tickets);
+        if (epoch === authEpoch && !authBlocked) acceptTickets(value.__h3_web_tickets);
         return rewriteJSON(value.__h3_web_payload);
       }
       return value;
     };
-    if (response.status === 401) showLogin('登入已失效，請重新輸入個人金鑰。');
+    if (response.status === 401 && epoch === authEpoch) { forgetSession(requestSession); lockAuth('登入已失效，請重新輸入個人金鑰。'); }
     return response;
   }
   class StudioXHR extends nativeXHR {
     open(method, value, ...rest) {
       const target = apiPath(value);
       if (!target || !session) throw new Error('此上傳不是目前公司的 Studio API。');
+      if (authBlocked) throw new Error('已登出，請重新登入。');
+      this.webSession = session; this.webAuthEpoch = authEpoch;
       target.searchParams.delete('ticket');
       super.open(method, target.href, ...rest);
-      this.setRequestHeader('Authorization', `Bearer ${session.token}`);
+      this.setRequestHeader('Authorization', `Bearer ${this.webSession.token}`);
       this.withCredentials = false;
       this.addEventListener('load', () => {
         const response = super.response;
-        if (this.responseType === 'json' && response && Object.prototype.hasOwnProperty.call(response, '__h3_web_payload')) {
+        if (this.webAuthEpoch === authEpoch && !authBlocked && this.responseType === 'json' && response && Object.prototype.hasOwnProperty.call(response, '__h3_web_payload')) {
           acceptTickets(response.__h3_web_tickets);
           this.webResponse = rewriteJSON(response.__h3_web_payload);
         }
-        if (this.status === 401) showLogin('登入已失效，請重新輸入個人金鑰。');
+        if (this.status === 401 && this.webAuthEpoch === authEpoch) { forgetSession(this.webSession); lockAuth('登入已失效，請重新輸入個人金鑰。'); }
       });
     }
     get response() { return this.webResponse === undefined ? super.response : this.webResponse; }
@@ -160,7 +207,7 @@
   const login = document.createElement('section');
   login.id = 'h3-web-login';
   login.setAttribute('aria-label', '連線公司 Studio');
-  login.innerHTML = `<div class="h3-login-shell"><div class="h3-login-story"><div class="h3-login-mark">H3.</div><div class="h3-login-eyebrow">COMPANY STUDIO / WEB ACCESS</div><h1>你的創作工作站</h1><p>在瀏覽器整理想法、生成畫面與剪輯影片。<br>選擇你的 GPU，繼續你的專案。</p><div class="h3-login-route"><span>01 選擇 GPU</span><span>02 驗證金鑰</span><span>03 開始創作</span></div></div><form class="h3-login-form"><h2>連線你的 GPU</h2><p>填入 GPU 電腦的共享 Gateway 網址，及那台電腦產生的金鑰。</p><label for="h3-web-gateway">GPU Gateway 網址</label><input id="h3-web-gateway" type="url" placeholder="http://192.168.1.20:8190" autocomplete="off" spellcheck="false"><small class="h3-login-help">每台 GPU 可使用不同網址。請連接公司內網。</small><label for="h3-web-key">個人金鑰</label><input id="h3-web-key" type="password" placeholder="h3g_…" required autocomplete="off" spellcheck="false"><small class="h3-login-help">請使用上方 GPU 電腦核發的金鑰。換 GPU 或金鑰會開啟另一個工作區。</small><details class="h3-login-advanced"><summary>網頁工作區服務設定</summary><label for="h3-web-server">Web 服務網址</label><input id="h3-web-server" type="url" placeholder="http://192.168.1.20:8795" required autocomplete="off" spellcheck="false"><small class="h3-login-help">由管理者設定，負責檔案與專案；不是 GPU Gateway 網址。</small></details><button class="h3-login-submit" type="submit">連線並開啟工作室 →</button><p class="h3-login-status" role="status" aria-live="polite"></p></form></div>`;
+  login.innerHTML = `<div class="h3-login-shell"><div class="h3-login-story"><div class="h3-login-mark">H3.</div><div class="h3-login-eyebrow">COMPANY STUDIO / WEB ACCESS</div><h1>你的創作工作站</h1><p>在瀏覽器整理想法、生成畫面與剪輯影片。<br>選擇你的 GPU，繼續你的專案。</p><div class="h3-login-route"><span>01 選擇 GPU</span><span>02 驗證金鑰</span><span>03 開始創作</span></div></div><form class="h3-login-form"><h2>連線你的 GPU</h2><p>填入 GPU 電腦的共享 Gateway 網址，及那台電腦產生的金鑰。</p><label for="h3-web-gateway">GPU Gateway 網址</label><input id="h3-web-gateway" type="url" placeholder="請輸入你的 GPU IP 網址（http://…:8190）" required autocomplete="off" spellcheck="false"><small class="h3-login-help">每台 GPU 可使用不同網址。請連接公司內網。</small><label for="h3-web-key">個人金鑰</label><input id="h3-web-key" type="password" placeholder="h3g_…" required autocomplete="off" spellcheck="false"><small class="h3-login-help">請使用上方 GPU 電腦核發的金鑰。換 GPU 或金鑰會開啟另一個工作區。</small><details class="h3-login-advanced"><summary>網頁工作區服務設定</summary><label for="h3-web-server">Web 服務網址</label><input id="h3-web-server" type="url" placeholder="http://192.168.1.20:8795" required autocomplete="off" spellcheck="false"><small class="h3-login-help">由管理者設定，負責檔案與專案；不是 GPU Gateway 網址。</small></details><button class="h3-login-submit" type="submit">連線並開啟工作室 →</button><p class="h3-login-status" role="status" aria-live="polite"></p></form></div>`;
   document.body.append(login);
   const form = login.querySelector('form');
   const serverInput = login.querySelector('#h3-web-server');
@@ -168,17 +215,23 @@
   const keyInput = login.querySelector('#h3-web-key');
   const status = login.querySelector('[role="status"]');
   serverInput.value = deployment.server || '';
-  gatewayInput.value = deployment.gateway_url || '';
   try {
     serverInput.value = window.localStorage.getItem(serverKey) || serverInput.value;
-    gatewayInput.value = window.localStorage.getItem(gatewayKey) || gatewayInput.value;
   } catch {}
   login.querySelector('details').open = !serverInput.value;
   function showLogin(message = '') {
     document.body.classList.add('h3-web-locked');
     login.hidden = false;
     status.textContent = message;
-    backButton.hidden = !session;
+    backButton.hidden = !session || authBlocked;
+  }
+  function lockAuth(message) {
+    authBlocked = true; authEpoch++;
+    tickets.clear();
+    const media = new Set(document.querySelectorAll('audio,video'));
+    for (const reference of mediaReferences) { const element = reference.deref(); if (element) media.add(element); }
+    for (const element of media) if (element instanceof HTMLMediaElement) element.pause();
+    showLogin(message);
   }
   const backButton = document.createElement('button');
   backButton.type = 'button'; backButton.className = 'h3-login-back';
@@ -197,18 +250,21 @@
     }
     return data;
   }
-  async function activate(value) {
+  async function activate(value, expectedShared, legacy = false) {
     if (loaded) {
       // A running editor's draft storage must retain its original identity.
       if (value.server !== session.server || value.user.id !== session.user.id)
         throw new Error('切換公司或使用者前，請先儲存專案並登出目前工作室。');
-      session = value; saveSession(value);
+      await saveSession(value, expectedShared, legacy);
+      authBlocked = false; authEpoch++;
+      session = value;
       login.hidden = true; document.body.classList.remove('h3-web-locked');
       updateMediaSources();
       return;
     }
+    await saveSession(value, expectedShared, legacy);
     session = value;
-    saveSession(value);
+    authBlocked = false; authEpoch++;
     login.hidden = true;
     document.body.classList.remove('h3-web-locked');
     document.body.classList.add('h3-web-managed');
@@ -221,8 +277,10 @@
     const exit = document.createElement('button');
     exit.textContent = '登出'; exit.type = 'button';
     exit.onclick = async () => {
-      await webAPI('/web/logout', { method: 'POST' }).catch(() => {});
-      window.sessionStorage.removeItem(authKey);
+      const previous = session;
+      lockAuth('已登出。');
+      await forgetSession(previous);
+      await webAPI('/web/logout', { method: 'POST', signal: AbortSignal.timeout(8000) }, previous).catch(() => {});
       // Keep session identity until unload completes so editor beforeunload
       // writes its draft to the same user's namespace, even if reload is cancelled.
       location.reload();
@@ -247,14 +305,16 @@
     setInterval(refreshMedia, 10 * 60 * 1000);
   }
   async function refreshMedia() {
-    if (!session || refreshing || !tickets.size) return;
+    if (!session || authBlocked || refreshing || !tickets.size) return;
+    const requestSession = session, epoch = authEpoch;
     refreshing = true;
     try {
       const paths = [...tickets.keys()].slice(-8192);
-      const result = await webAPI('/web/media-tickets', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({paths}) });
+      const result = await webAPI('/web/media-tickets', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({paths}) }, requestSession);
+      if (epoch !== authEpoch || authBlocked) return;
       acceptTickets(result.tickets);
       updateMediaSources();
-    } catch (error) { if (error.status === 401) showLogin('連線已失效，請重新登入。'); }
+    } catch (error) { if (error.status === 401 && epoch === authEpoch) { forgetSession(requestSession); lockAuth('連線已失效，請重新登入。'); } }
     finally { refreshing = false; }
   }
   function updateMediaSources() {
@@ -281,52 +341,90 @@
   form.addEventListener('submit', async event => {
     event.preventDefault();
     const button = form.querySelector('button');
+    const epoch = authEpoch, expectedShared = sharedSession();
+    let pendingLogin = null;
     button.disabled = true; status.textContent = '正在驗證金鑰並開啟你的工作室…';
     try {
       const server = normalizeServer(serverInput.value.trim());
-      let gateway = gatewayInput.value.trim() ? normalizeGateway(gatewayInput.value.trim()) : '';
+      const gateway = normalizeGateway(gatewayInput.value.trim());
       // Check the endpoint before transmitting a personal key.
       const health = await webAPI('/web/health', {signal: AbortSignal.timeout(8000)}, {server});
       if (health.service !== 'h3-studio-web')
         throw new Error('指定網址不是 Studio Web 入口。請確認主機網址與連接埠，預設為 8795。');
-      if (gateway) {
-        if (typeof health.version !== 'number' || health.version < 2 || typeof health.allow_custom_gateways !== 'boolean' || !health.default_gateway_url)
-          throw new Error('Web 服務版本尚未支援選擇 GPU，請管理者更新後台。');
-        if (gateway !== normalizeGateway(health.default_gateway_url) && !health.allow_custom_gateways)
-          throw new Error('此 Web 服務尚未開放其他 GPU Gateway，請管理者啟用此功能。');
-      } else if (health.default_gateway_url) gateway = normalizeGateway(health.default_gateway_url);
-      const result = await webAPI('/web/login', { method: 'POST', signal: AbortSignal.timeout(60000), headers: {'Content-Type': 'application/json'}, body: JSON.stringify({key: keyInput.value.trim(), ...(gateway ? {gateway_url: gateway} : {})}) }, {server});
+      if (typeof health.version !== 'number' || health.version < 2 || typeof health.allow_custom_gateways !== 'boolean' || !health.default_gateway_url)
+        throw new Error('Web 服務版本尚未支援選擇 GPU，請管理者更新後台。');
+      if (gateway !== normalizeGateway(health.default_gateway_url) && !health.allow_custom_gateways)
+        throw new Error('此 Web 服務尚未開放其他 GPU Gateway，請管理者啟用此功能。');
+      const result = await webAPI('/web/login', { method: 'POST', signal: AbortSignal.timeout(60000), headers: {'Content-Type': 'application/json'}, body: JSON.stringify({key: keyInput.value.trim(), gateway_url: gateway}) }, {server});
+      pendingLogin = {...result, server};
       keyInput.value = '';
+      if (epoch !== authEpoch) {
+        throw new Error('登入狀態已在其他分頁變更，請重新整理。');
+      }
       if (loaded && session && (server !== session.server || result.user.id !== session.user.id)) {
-        await webAPI('/web/logout', {method: 'POST'}, {...result, server}).catch(() => {});
         throw new Error('切換公司或使用者前，請先返回工作室、儲存專案並登出。');
       }
       try {
         window.localStorage.setItem(serverKey, server);
-        if (gateway) window.localStorage.setItem(gatewayKey, gateway);
       } catch {}
-      if (session?.token) await webAPI('/web/logout', {method: 'POST'}).catch(() => {});
+      const previous = session;
       tickets.clear();
-      await activate({...result, server});
+      await activate(pendingLogin, expectedShared);
+      pendingLogin = null;
+      if (previous?.token && previous.token !== result.token) await webAPI('/web/logout', {method: 'POST', signal: AbortSignal.timeout(8000)}, previous).catch(() => {});
     } catch (error) {
+      if (pendingLogin) await webAPI('/web/logout', {method: 'POST', signal: AbortSignal.timeout(8000)}, pendingLogin).catch(() => {});
       status.textContent = error instanceof TypeError ? '無法連線公司主機。請確認使用 Studio Web 網址（8795）、公司內網及瀏覽器區域網路權限；同事電腦連線也需要主機防火牆開放。' :
         error.name === 'TimeoutError' ? '公司主機連線逾時。請確認內網、主機網址與 8795 防火牆規則。' :
         error instanceof SyntaxError ? '指定網址沒有提供 Studio Web API。請確認使用管理者提供的 Web 主機網址（預設 8795）。' : error.message;
     } finally { button.disabled = false; }
   });
-  document.addEventListener('visibilitychange', () => { if (!document.hidden) refreshMedia(); });
+  async function syncSharedAuth(force = false) {
+    const epoch = ++authEpoch;
+    const current = sharedSession();
+    if (!current || (loaded && (current.server !== session.server || current.user?.id !== session.user.id))) {
+      try { window.sessionStorage.removeItem(authKey); } catch {}
+      lockAuth(current ? '其他分頁已切換使用者或 GPU。請重新整理；目前草稿仍屬於原工作區。' : '已在其他分頁登出。請重新登入。');
+      return;
+    }
+    if (current.token === session?.token && !authBlocked && !force) return;
+    try {
+      current.server = normalizeServer(current.server);
+      const state = await webAPI('/web/session', {signal: AbortSignal.timeout(15000)}, current);
+      // A logout or another login while validation was pending wins.
+      if (epoch !== authEpoch || !sameAuth(sharedSession(), current)) return;
+      tickets.clear();
+      serverInput.value = current.server;
+      gatewayInput.value = state.gateway_url || '';
+      await activate({...current, ...state}, current);
+    } catch (error) {
+      if (epoch !== authEpoch || !sameAuth(sharedSession(), current)) return;
+      if (error.status === 401) forgetSession(current);
+      lockAuth(error.status === 503 ? 'GPU 主機暫時無法連線，請稍後重新整理。' : '請重新登入。');
+    }
+  }
+  window.addEventListener('storage', event => {
+    if (event.storageArea === window.localStorage && event.key === sharedAuthKey) syncSharedAuth();
+  });
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden && session) syncSharedAuth().then(refreshMedia);
+  });
+  window.addEventListener('pageshow', event => { if (event.persisted) syncSharedAuth(true); });
   (async () => {
+    const epoch = authEpoch, initialShared = sharedSession();
     const previous = readSession();
     if (!previous?.server || !previous?.token || !previous?.user?.id) return;
     try {
       previous.server = normalizeServer(previous.server);
-      const state = await webAPI('/web/session', {}, previous);
+      const state = await webAPI('/web/session', {signal: AbortSignal.timeout(15000)}, previous);
+      if (epoch !== authEpoch || (initialShared ? !sameAuth(sharedSession(), previous) : sharedSession() && !sameAuth(sharedSession(), previous))) return;
       serverInput.value = previous.server;
       if (state.gateway_url) gatewayInput.value = state.gateway_url;
-      await activate({...previous, ...state});
+      await activate({...previous, ...state}, initialShared, !initialShared);
     } catch (error) {
-      if (error.status === 401) window.sessionStorage.removeItem(authKey);
-      showLogin(error.status === 503 ? 'GPU 主機暫時無法連線，請稍後重新整理。' : '請重新輸入金鑰以連線公司 Studio。');
+      if (epoch !== authEpoch) return;
+      if (error.status === 401) forgetSession(previous);
+      lockAuth(error.status === 503 ? 'GPU 主機暫時無法連線，請稍後重新整理。' : '請重新輸入金鑰以連線公司 Studio。');
     }
   })();
 })();

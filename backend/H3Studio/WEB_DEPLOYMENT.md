@@ -6,6 +6,10 @@ Web 主機執行專案根目錄 `start_h3_web_server.bat`，提供完整 Studio 
 
 現有本機介面與作品不會搬動。Web 使用者新增資料在 `H3Studio/data/web_users/<Gateway使用者ID>/data/`，個人連線設定在該使用者自己的 `config.json`。工作程序只監聽 loopback，所有請求另需入口生成的內部隨機 token。
 
+首次登入的 GPU 網址欄位保持空白，由使用者自行填入，不會自動改用管理者預設 GPU。同一瀏覽器的影片、圖片與剪輯共用最長 8 小時的 Web 登入憑證，每頁先向 `/web/session` 驗證才開啟；GPU 原始金鑰不保存在瀏覽器。任一分頁登出或換使用者會鎖住其他工作室；原本剪輯草稿保留在原使用者空間，不能直接切換身份。
+
+共享登入只適用同一瀏覽器設定檔。GitHub Pages 同帳號的其他 Repo 與本站共用 origin，可讀到 localStorage 登入憑證；Repo 路徑前綴只是命名，需將同一帳號發布的所有網站視為可信。Chrome／Edge 使用 Web Locks 序列化共享登入更新，持久的協定標記阻止登出後還原舊分頁登入。儲存被禁止時不會留下半完成登入，而會撤銷新 Web 憑證並提示瀏覽器儲存限制。
+
 若 GPU Gateway 位於另一台電腦，可使用 `--gateway-url http://<GPU內網IP>:8190 --remote-auth`。也可在主機私人檔案 `H3Studio/data/web_server.settings.json` 設定 `gateway_url`、`remote_auth: true` 及 `origins`，之後雙擊原啟動腳本會沿用設定；不要將此檔案或金鑰提交至 Repo。Web 主機網址仍填 Web 電腦的 8795，個人金鑰則使用該遠端 GPU Gateway 核發的金鑰。
 
 若同事使用不同 GPU 電腦，另加 `--allow-custom-gateways`，或在私人設定加入 `allow_custom_gateways: true`（必須配合 `remote_auth: true`）。每次登入可傳 `gateway_url`，登入、session、媒體票證、生成與 worker 設定皆固定使用該網址，不會在連線失敗時改用預設 GPU。金鑰必須由指定 Gateway 核發；用 A 主機的金鑰登入 B 主機會被 B 拒絕。固定模式拒絕與管理者設定不同的網址。
