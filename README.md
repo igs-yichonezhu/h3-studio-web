@@ -60,6 +60,8 @@ python H3Studio/web_server.py --cert C:/certs/studio.crt --key C:/certs/studio.k
 
 影片工作每 3 秒、圖片工作每 4 秒自動同步；提交成功立即顯示工作，完成後自動顯示成果。讀取逾時會恢復輪詢，返回分頁或網路恢復時立即同步，保留表單與專案。正在播放的影片不阻擋其他工作更新。後台每 5 秒核對引擎完成紀錄，避免持續狀態訊息延後完成判定；安裝套件包含 progress-monitor.patch。網站更新後重新整理一次即可載入版本化的介面資源。
 
+生成同步修正通過 116 項既有介面／圖片回歸、30 項網頁建置／登入／更新、62 項引擎監控／佇列／Qwen 及 19 項 Web 後台測試。安裝腳本在 Windows PowerShell 5 與 PowerShell 7 均通過首次、重複及舊公司入口升級的隔離驗證，保留設定與資料。
+
 ## Repo 與發布
 
 `site/` 是唯一發布目錄，只包含介面 HTML/CSS/JS 等靜態檔案。`backend/` 是公司部署檔，不會由 Pages 發布。

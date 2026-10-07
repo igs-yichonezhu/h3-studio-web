@@ -4,18 +4,31 @@ $taskRoot = (Resolve-Path -LiteralPath $StudioRoot).Path
 if (-not (Test-Path -LiteralPath (Join-Path $taskRoot 'H3Studio/app.py'))) {
     throw 'StudioRoot must be the installed movieeasymake project root.'
 }
+function Test-GitPatch {
+    param([string]$PatchPath, [switch]$Reverse)
+    $taskPreviousPreference = $ErrorActionPreference
+    try {
+        # Windows PowerShell 5 treats stderr from a failed probe as a terminating
+        # error under Stop, even with 2>$null. The exit code decides applicability.
+        $ErrorActionPreference = 'Continue'
+        if ($Reverse) {
+            & git -C $taskRoot apply --reverse --check $PatchPath 2>$null
+        } else {
+            & git -C $taskRoot apply --check $PatchPath 2>$null
+        }
+        return $LASTEXITCODE -eq 0
+    } finally {
+        $ErrorActionPreference = $taskPreviousPreference
+    }
+}
 $taskPatches = @('company-backend.patch', 'progress-monitor.patch')
 foreach ($taskPatchName in $taskPatches) {
     $taskPatch = Join-Path $PSScriptRoot $taskPatchName
-    & git -C $taskRoot apply --check $taskPatch 2>$null
-    if ($LASTEXITCODE -eq 0) {
+    if (Test-GitPatch -PatchPath $taskPatch) {
         & git -C $taskRoot apply $taskPatch
         if ($LASTEXITCODE -ne 0) { throw 'Could not apply backend patch.' }
-    } else {
-        & git -C $taskRoot apply --reverse --check $taskPatch 2>$null
-        if ($LASTEXITCODE -ne 0) {
-            throw 'Installed Studio version differs. Preserve local changes and update it before applying this package.'
-        }
+    } elseif (-not (Test-GitPatch -PatchPath $taskPatch -Reverse)) {
+        throw 'Installed Studio version differs. Preserve local changes and update it before applying this package.'
     }
 }
 foreach ($taskName in @('web_server.py', 'web_worker.py', 'WEB_DEPLOYMENT.md')) {
