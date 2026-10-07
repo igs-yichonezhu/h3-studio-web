@@ -1,0 +1,143 @@
+diff --git a/H3Studio/comfy_client.py b/H3Studio/comfy_client.py
+index cc87482..06a0197 100644
+--- a/H3Studio/comfy_client.py
++++ b/H3Studio/comfy_client.py
+@@ -24,6 +24,8 @@ from queue_cancel import cancel_queue_prompt
+ 
+ 
+ ProgressCallback = Callable[[dict[str, Any]], Awaitable[None]]
++HISTORY_REQUEST_TIMEOUT = 15
++HISTORY_POLL_INTERVAL = 5
+ 
+ 
+ class ComfyClient:
+@@ -278,11 +280,15 @@ class ComfyClient:
+         session: aiohttp.ClientSession | None = None,
+     ) -> dict[str, Any]:
+         owns_session = session is None
++        timeout = aiohttp.ClientTimeout(total=HISTORY_REQUEST_TIMEOUT)
+         if session is None:
+-            session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15))
++            session = aiohttp.ClientSession(timeout=timeout)
+         try:
+             try:
+-                async with session.get(f"{self.base_url}/history/{prompt_id}", headers=self.auth_headers()) as response:
++                # A monitoring session has no overall timeout because its WebSocket
++                # stays open. Bound each history request, including its JSON body.
++                async with session.get(f"{self.base_url}/history/{prompt_id}",
++                                       headers=self.auth_headers(), timeout=timeout) as response:
+                     if response.status != 200:
+                         return {}
+                     payload = await response.json()
+@@ -331,55 +337,76 @@ class ComfyClient:
+                     pass
+             await callback({"prompt_id": prompt_id, "status": "running", "progress": 0})
+ 
+-            reconnect_delay = 1.0
+-            while True:
++            async def finished_history() -> dict[str, Any] | None:
++                history = await self.get_history(prompt_id, session)
+                 if cancel_event.is_set():
+                     await self.interrupt(prompt_id)
+                     raise asyncio.CancelledError
+-
+-                history = await self.get_history(prompt_id, session)
+                 state = self.history_state(history)
+                 if state == "success":
+-                    return prompt_id, history
++                    return history
+                 if state == "error":
+                     raise RuntimeError(self.history_error(history))
++                return None
++
++            reconnect_delay = 1.0
++            while True:
++                if cancel_event.is_set():
++                    await self.interrupt(prompt_id)
++                    raise asyncio.CancelledError
++
++                history = await finished_history()
++                if history is not None:
++                    return prompt_id, history
+ 
+                 try:
+                     async with session.ws_connect(
+                         f"{ws_url}/ws?clientId={client_id}", heartbeat=30, headers=self.auth_headers()
+                     ) as ws:
+                         reconnect_delay = 1.0
+-                        last_history_check = time.monotonic()
++                        next_history_check = time.monotonic() + HISTORY_POLL_INTERVAL
+                         while True:
+                             if cancel_event.is_set():
+                                 await self.interrupt(prompt_id)
+                                 raise asyncio.CancelledError
++                            # Status broadcasts and previews can arrive continuously.
++                            # Poll history by elapsed time, never by socket idleness.
++                            if time.monotonic() >= next_history_check:
++                                history = await finished_history()
++                                if history is not None:
++                                    return prompt_id, history
++                                next_history_check = time.monotonic() + HISTORY_POLL_INTERVAL
+                             try:
+-                                message = await asyncio.wait_for(ws.receive(), timeout=2)
++                                remaining = max(0.001, next_history_check - time.monotonic())
++                                message = await asyncio.wait_for(ws.receive(), timeout=min(2, remaining))
+                             except asyncio.TimeoutError:
+-                                if time.monotonic() - last_history_check < 5:
+-                                    continue
+-                                last_history_check = time.monotonic()
+-                                history = await self.get_history(prompt_id, session)
+-                                state = self.history_state(history)
+-                                if state == "success":
+-                                    return prompt_id, history
+-                                if state == "error":
+-                                    raise RuntimeError(self.history_error(history))
+                                 continue
+                             if message.type == aiohttp.WSMsgType.TEXT:
+                                 event = json.loads(message.data)
+                                 data = event.get("data") or {}
+                                 if data.get("prompt_id") not in {None, prompt_id}:
+                                     continue
+-                                if event.get("type") == "progress":
++                                event_type = event.get("type")
++                                terminal = event_type in {"execution_success", "execution_error", "execution_interrupted"} or (
++                                    event_type == "executing" and data.get("node") is None
++                                )
++                                if terminal:
++                                    # A terminal notification may precede history being
++                                    # saved. Only this prompt's history proves completion.
++                                    if data.get("prompt_id") != prompt_id:
++                                        continue
++                                    history = await finished_history()
++                                    if history is not None:
++                                        return prompt_id, history
++                                    next_history_check = time.monotonic() + HISTORY_POLL_INTERVAL
++                                    if event_type == "execution_error":
++                                        raise RuntimeError(data.get("exception_message") or "ComfyUI 執行失敗。")
++                                elif event_type == "progress":
+                                     maximum = max(1, int(data.get("max") or 1))
+                                     value = int(data.get("value") or 0)
+                                     await callback({"status": "running", "progress": round(value / maximum * 100, 1)})
+-                                elif event.get("type") == "executing":
++                                elif event_type == "executing":
+                                     await callback({"status": "running", "current_node": data.get("node")})
+-                                elif event.get("type") == "execution_error":
+-                                    raise RuntimeError(data.get("exception_message") or "ComfyUI 執行失敗。")
+                             elif message.type == aiohttp.WSMsgType.BINARY:
+                                 preview = self.decode_preview_message(message.data)
+                                 if preview:
+@@ -390,12 +417,9 @@ class ComfyClient:
+                 except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
+                     pass
+ 
+-                history = await self.get_history(prompt_id, session)
+-                state = self.history_state(history)
+-                if state == "success":
++                history = await finished_history()
++                if history is not None:
+                     return prompt_id, history
+-                if state == "error":
+-                    raise RuntimeError(self.history_error(history))
+                 await callback({"status": "running", "current_node": "進度連線中斷，正在自動重連"})
+                 await asyncio.sleep(reconnect_delay)
+                 reconnect_delay = min(10.0, reconnect_delay * 2)

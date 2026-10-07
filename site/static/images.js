@@ -5,7 +5,8 @@
   const draftKey = 'h3-qwen-image-21-draft-v1';
   const fields = ['imageMode','imageName','imagePrompt','imageWidth','imageHeight','imageSteps','imageSeed','imageSeedAuto','imageTransparent','referenceResolution','imageLora','imageLoraStrength'];
   let refs = [], ready = false, uploading = false, submitting = false, page = 1, totalPages = 1, jobs = [], queue = null, polling = false;
-  const deletedIds = new Set();
+  const deletedIds = new Set(), submittedJobs = new Map();
+  let refreshVersion = 0, refreshPending = false, statusVersion = 0, checkingStatus = false;
   let pendingDelete = null;
   let pendingUpscale = null, upscaleModels = [], upscaleReady = false;
   let selectedLora = '', loraSupported = false, availableLoras = [], lastJobsMarkup = '';
@@ -17,11 +18,28 @@
     cutout:'擷取圖 1 中的【指定主體】，移除背景並生成透明背景，保留主體外觀、顏色與完整輪廓。'
   };
   async function api(url, options) {
-    const response = await H3Web.fetch(url, options);
-    let data;
-    try { data = await response.json(); } catch { throw new Error('Studio 後端尚未更新或回應格式錯誤，請確認工具版本並重新啟動。'); }
-    if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
-    return data;
+    const readOnly = !options?.method || options.method.toUpperCase() === 'GET';
+    const controller = readOnly ? new AbortController() : null;
+    let timer;
+    const request = (async () => {
+      const response = await H3Web.fetch(url, readOnly ? {...options, cache:'no-store', signal:controller.signal} : options);
+      let data;
+      try { data = await response.json(); } catch(error) {
+        if (controller?.signal.aborted) throw error;
+        throw new Error('Studio 後端尚未更新或回應格式錯誤，請確認工具版本並重新啟動。');
+      }
+      if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+      return data;
+    })();
+    if (!readOnly) return request;
+    try {
+      return await Promise.race([request, new Promise((_, reject) => {
+        timer = setTimeout(() => {
+          reject(new Error('連線逾時，稍後會重新同步；請確認公司主機與網路連線。'));
+          controller.abort();
+        }, 15000);
+      })]);
+    } finally { clearTimeout(timer); }
   }
   function update() {
     const edit = $('imageMode').value === 'edit';
@@ -98,15 +116,24 @@
       availableLoras.length ? `目前引擎提供 ${availableLoras.length} 個專用資料夾中的 LoRA；請確認作者標示的基礎模型與觸發詞。` : '目前引擎尚未安裝 Qwen-Image-2.1 專用 LoRA，可直接使用基礎模型。';
     update();
   }
-  async function checkStatus() {
+  async function checkStatus(force = false) {
+    if (checkingStatus && force !== true) return;
+    const version = ++statusVersion;
+    checkingStatus = true;
     $('refreshStatus').disabled = true;
     try {
-      const result = await api(H3Web.url('/api/images/status')); ready = result.ready === true;
+      const result = await api(H3Web.url('/api/images/status'));
+      if (version !== statusVersion) return;
+      ready = result.ready === true;
       loraSupported = result.lora_supported === true; availableLoras = Array.isArray(result.loras) ? result.loras : []; renderLoras();
       $('engineStatus').textContent = ready ? 'Qwen-Image-2.1 已就緒' : '圖片引擎尚未就緒';
       $('engineDetail').textContent = result.error || `${result.mode === 'remote' ? '共用遠端' : '本機'}引擎 · 官方 INT8 模型 · 圖片與影片依佇列順序處理`;
-    } catch (error) { ready = false; $('engineStatus').textContent = '暫時無法檢查引擎'; $('engineDetail').textContent = error.message; }
-    finally { $('refreshStatus').disabled = false; update(); }
+    } catch (error) {
+      if (version !== statusVersion) return;
+      ready = false; $('engineStatus').textContent = '暫時無法檢查引擎'; $('engineDetail').textContent = error.message;
+    } finally {
+      if (version === statusVersion) { checkingStatus = false; $('refreshStatus').disabled = false; update(); }
+    }
   }
   function jobStatus(job) {
     if (job.status === 'completed') return '已完成';
@@ -134,15 +161,64 @@
     $('pageLabel').textContent = `第 ${page} / ${totalPages} 頁`;
     $('previousPage').disabled = page <= 1; $('nextPage').disabled = page >= totalPages;
   }
-  async function refresh() {
-    if (polling) return;
+  async function refresh(force = false) {
+    if (polling && force !== true) { refreshPending = true; return; }
+    const version = ++refreshVersion, requestedPage = page;
     polling = true;
-    const results = await Promise.allSettled([api(H3Web.url(`/api/images/jobs?page=${page}`)),api(H3Web.url('/api/queue'))]);
-    if (results[0].status === 'fulfilled') { const data = results[0].value; jobs = data.items.filter(job=>!deletedIds.has(job.id)); page = data.page; totalPages = data.total_pages; }
-    else $('imageQueue').textContent = results[0].reason.message;
-    queue = results[1].status === 'fulfilled' ? results[1].value : null;
-    if (results[0].status === 'fulfilled') $('imageQueue').textContent = queue?.available ? `共享引擎：執行 ${queue.running_count} 筆 · 排隊 ${queue.pending_count} 筆 · 本機待送出 ${queue.local_waiting_count} 筆` : '暫時無法取得共享引擎佇列，工作仍可能進行中。';
-    renderJobs(); polling = false;
+    refreshPending = false;
+    let jobsError = '', queueError = '', queuePending = true;
+    const current = () => version === refreshVersion;
+    function renderQueueStatus() {
+      $('imageQueue').textContent = jobsError || (queuePending ? '正在同步共享引擎佇列…' :
+        queue?.available ? `共享引擎：執行 ${queue.running_count} 筆 · 排隊 ${queue.pending_count} 筆 · 本機待送出 ${queue.local_waiting_count} 筆` :
+        queueError ? `${queueError} 工作仍可能進行中。` : '暫時無法取得共享引擎佇列，工作仍可能進行中。');
+    }
+    try {
+      await Promise.all([
+        (async () => {
+          try {
+            const data = await api(H3Web.url(`/api/images/jobs?page=${requestedPage}`));
+            if (!current()) return;
+            if (!Array.isArray(data.items)) throw new Error('圖片工作清單回應格式錯誤，稍後會重新同步。');
+            jobs = data.items.filter(job=>!deletedIds.has(job.id));
+            page = data.page; totalPages = data.total_pages;
+            for (const job of jobs) submittedJobs.delete(job.id);
+            if (page === 1) jobs = [...submittedJobs.values()].filter(job=>!deletedIds.has(job.id)).concat(jobs);
+            renderQueueStatus(); renderJobs();
+          } catch(error) {
+            if (current()) { jobsError = error.message; renderQueueStatus(); }
+          }
+        })(),
+        (async () => {
+          try {
+            const result = await api(H3Web.url('/api/queue'));
+            if (!current()) return;
+            queue = result;
+          } catch(error) {
+            if (!current()) return;
+            queue = null; queueError = error.message;
+          }
+          if (current()) { queuePending = false; renderQueueStatus(); renderJobs(); }
+        })()
+      ]);
+    } catch(error) {
+      if (current()) $('imageQueue').textContent = error.message || '圖片狀態同步失敗，稍後會重新同步。';
+    } finally {
+      if (current()) {
+        polling = false;
+        if (refreshPending) { refreshPending = false; void refresh(); }
+      }
+    }
+  }
+  function showSubmittedJob(job) {
+    const previousJobs = page === 1 ? jobs : [];
+    page = 1;
+    if (job?.id) {
+      submittedJobs.set(job.id, job);
+      jobs = [job, ...previousJobs.filter(previous=>previous.id !== job.id)];
+    }
+    renderJobs();
+    void refresh(true);
   }
   $('imageForm').addEventListener('submit', async event => {
     event.preventDefault();
@@ -155,9 +231,9 @@
     submitting = true; update();
     try {
       const job = await api(H3Web.url('/api/images/jobs'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
-      $('imageSeed').value = job.seed; saveDraft(); page = 1;
+      $('imageSeed').value = job.seed; saveDraft();
       $('formMessage').textContent = `圖片工作已加入佇列 · Seed ${job.seed}`;
-      await refresh();
+      showSubmittedJob(job);
     } catch(error) { $('formMessage').textContent = error.message; }
     finally { submitting = false; update(); }
   });
@@ -191,7 +267,7 @@
         $('deleteImageDialog').showModal();
         return;
       }
-      if (button.dataset.cancel) { await api(H3Web.url(`/api/images/jobs/${button.dataset.cancel}/cancel`),{method:'POST'}); await refresh(); }
+      if (button.dataset.cancel) { await api(H3Web.url(`/api/images/jobs/${button.dataset.cancel}/cancel`),{method:'POST'}); void refresh(true); }
       if (button.dataset.compare) {
         const job=jobs.find(j=>j.id === button.dataset.compare);
         if(job?.image_asset_ids?.length) {
@@ -251,9 +327,9 @@
     const source=pendingUpscale;
     submitting=true; update(); updateUpscale(); $('cancelUpscale').disabled=true;
     try {
-      await api(H3Web.url(`/api/images/jobs/${source.id}/upscale`),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({scale:Number($('upscaleScale').value),model:$('upscaleModel').value})});
-      pendingUpscale=null; $('upscaleDialog').close(); page=1;
-      $('formMessage').textContent='已加入增強放大佇列，完成後會另存新圖片。'; await refresh();
+      const job = await api(H3Web.url(`/api/images/jobs/${source.id}/upscale`),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({scale:Number($('upscaleScale').value),model:$('upscaleModel').value})});
+      pendingUpscale=null; $('upscaleDialog').close();
+      $('formMessage').textContent='已加入增強放大佇列，完成後會另存新圖片。'; showSubmittedJob(job);
     } catch(error) { $('upscaleError').textContent=error.message; }
     finally {submitting=false; update(); updateUpscale(); $('cancelUpscale').disabled=false;}
   });
@@ -265,17 +341,20 @@
     uploading=true; update(); $('confirmImageDelete').disabled=true; $('cancelImageDelete').disabled=true;
     try {
       await api(H3Web.url(`/api/images/jobs/${id}`),{method:'DELETE'});
-      deletedIds.add(id); jobs=jobs.filter(j=>j.id !== id); renderJobs();
+      deletedIds.add(id); submittedJobs.delete(id); jobs=jobs.filter(j=>j.id !== id); renderJobs();
       pendingDelete=null; $('deleteImageDialog').close();
       $('formMessage').textContent='圖片工作已刪除；已轉存的參考圖與 ComfyUI 原始輸出仍保留。';
-      await refresh();
+      void refresh(true);
     } catch(error) { $('deleteImageError').textContent=error.message; }
     finally {uploading=false; update(); $('confirmImageDelete').disabled=false; $('cancelImageDelete').disabled=false;}
   });
   $('closeCompare').addEventListener('click',()=> $('imageCompare').close());
-  $('refreshStatus').addEventListener('click',checkStatus); $('refreshJobs').addEventListener('click',refresh);
-  $('previousPage').addEventListener('click',()=>{ if(page>1) {page--;refresh();} });
-  $('nextPage').addEventListener('click',()=>{if(page<totalPages) {page++;refresh();} });
+  $('refreshStatus').addEventListener('click',()=>checkStatus(true)); $('refreshJobs').addEventListener('click',()=>refresh(true));
+  $('previousPage').addEventListener('click',()=>{ if(page>1) {page--;void refresh(true);} });
+  $('nextPage').addEventListener('click',()=>{if(page<totalPages) {page++;void refresh(true);} });
+  function resume() { if (!document.hidden) { void checkStatus(true); void refresh(true); } }
+  document.addEventListener('visibilitychange', resume);
+  window.addEventListener('online', resume);
   renderRefs(); checkStatus(); refresh();
-  setInterval(()=>{if(!document.hidden) refresh();},4000);
+  setInterval(()=>{if(!document.hidden) { void refresh(); if (!ready) void checkStatus(); }},4000);
 })();

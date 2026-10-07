@@ -76,6 +76,10 @@ let jobPage = 1;
 let jobTotalPages = 1;
 let jobSearch = "";
 let lastJobOptionsLoad = 0;
+let jobOptionsVersion = 0;
+let jobsRefreshVersion = 0;
+let jobsRefreshing = false;
+let quickJobItems = [];
 const expandedJobIds = new Set();
 let toastTimer;
 let engineStartingAt = 0;
@@ -111,6 +115,9 @@ let shortFilmJobPage = 1;
 let shortFilmJobTotalPages = 1;
 let shortFilmJobSearch = "";
 let lastShortFilmJobsSignature = "";
+let shortFilmRefreshVersion = 0;
+let shortFilmJobsRefreshing = false;
+let shortFilmJobItems = [];
 const expandedShortFilmJobIds = new Set();
 
 const modeLabels = { t2v: "文生影片", fl2va: "首尾圖片", r2v: "多模態參考", replace: "角色替換", symbol_loop: "圖騰循環", extend: "續接影片", popup_panel: "彈窗面板動畫", mg_animation: "MG 動畫" };
@@ -230,14 +237,37 @@ function installInteractionMotion() {
 }
 
 async function api(url, options = {}) {
-  const response = await H3Web.fetch(url, options);
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    const error = new Error(data?.error || `HTTP ${response.status}`);
-    error.status = response.status;
-    throw error;
+  const reading = ["GET", "HEAD"].includes((options.method || "GET").toUpperCase());
+  const controller = reading ? new AbortController() : null;
+  let timedOut = false;
+  const abort = () => controller?.abort(options.signal?.reason);
+  if (controller && options.signal) {
+    if (options.signal.aborted) abort();
+    else options.signal.addEventListener("abort", abort, { once: true });
   }
-  return data;
+  const timer = controller ? setTimeout(() => { timedOut = true; controller.abort(); }, 15000) : null;
+  try {
+    const response = await H3Web.fetch(url, controller ? { ...options, cache: "no-store", signal: controller.signal } : options);
+    let data;
+    try { data = await response.json(); }
+    catch (error) {
+      if (controller?.signal.aborted) throw error;
+      if (response.ok) throw new Error("Studio 回應格式錯誤。");
+      data = {};
+    }
+    if (!response.ok) {
+      const error = new Error(data?.error || `HTTP ${response.status}`);
+      error.status = response.status;
+      throw error;
+    }
+    return data;
+  } catch (error) {
+    if (timedOut) throw new Error("讀取工作狀態逾時，稍後會自動重試。");
+    throw error;
+  } finally {
+    if (timer) clearTimeout(timer);
+    if (controller && options.signal) options.signal.removeEventListener("abort", abort);
+  }
 }
 
 function connectionPayload() {
@@ -1819,7 +1849,11 @@ async function renderVideo() {
       body: JSON.stringify(payload),
     });
     toast(`工作 ${job.id.slice(0, 8)} 已加入佇列`);
-    await loadJobs(true);
+    const visible = jobPage === 1 && !jobSearch ? quickJobItems.filter(item => item.id !== job.id) : [];
+    jobPage = 1; jobSearch = ""; $("#jobSearch").value = "";
+    quickJobItems = [job, ...visible].slice(0, 20); jobTotalPages = 1;
+    renderVideoJobs(quickJobItems, { total: visible.length + 1 }, true);
+    loadJobs(true); loadSharedQueue();
     $(".jobs-section").scrollIntoView({ behavior: "smooth" });
   } catch (error) {
     toast(error.message, true);
@@ -2273,12 +2307,45 @@ async function useContinuationFile(file) {
   await prepareContinuation({ asset_id: asset.id });
 }
 
+function updateJobCards(list, markup, idField) {
+  // Keep a playing video's card attached while other jobs continue updating.
+  const template = document.createElement("template");
+  template.innerHTML = markup;
+  const existing = new Map([...list.children].map(card => [card.dataset[idField], card]));
+  let deferred = false;
+  const desired = [...template.content.children].map(card => {
+    const previous = existing.get(card.dataset[idField]);
+    if (previous && [...previous.querySelectorAll("video")].some(video => !video.paused)) {
+      deferred = true;
+      return previous;
+    }
+    return card;
+  });
+  let cursor = list.firstElementChild;
+  for (const card of desired) {
+    if (card === cursor) cursor = cursor.nextElementSibling;
+    else list.insertBefore(card, cursor);
+  }
+  const retained = new Set(desired);
+  for (const card of [...list.children]) if (!retained.has(card)) card.remove();
+  return deferred;
+}
+
+function showJobsRefresh(id, error = null) {
+  const element = $("#" + id);
+  if (element) element.textContent = error
+    ? `工作狀態暫時無法更新，會自動重試。${error.message}`
+    : `每 3 秒自動更新 · 更新於 ${new Date().toLocaleTimeString("zh-TW", { hour12: false })}`;
+}
+
 async function loadJobs(force = false) {
+  if (jobsRefreshing && !force) return;
+  const version = ++jobsRefreshVersion, requestedPage = jobPage, requestedSearch = jobSearch;
+  jobsRefreshing = true;
   try {
-    const query = encodeURIComponent(jobSearch);
-    const response = await api(H3Web.url(`/api/jobs?page=${jobPage}&page_size=20&q=${query}&workspace=quick`));
-    let jobs;
-    let meta;
+    const response = await api(H3Web.url(`/api/jobs?page=${requestedPage}&page_size=20&q=${encodeURIComponent(requestedSearch)}&workspace=quick`));
+    if (version !== jobsRefreshVersion || requestedPage !== jobPage || requestedSearch !== jobSearch) return;
+    let jobs, meta;
     if (Array.isArray(response)) {
       const filtered = jobSearch ? response.filter(job => `${job.name || ""} ${job.id} ${job.mode}`.toLowerCase().includes(jobSearch.toLowerCase())) : response;
       jobTotalPages = Math.max(1, Math.ceil(filtered.length / 20));
@@ -2286,19 +2353,29 @@ async function loadJobs(force = false) {
       jobs = filtered.slice((jobPage - 1) * 20, jobPage * 20);
       meta = { total: filtered.length, total_pages: jobTotalPages, page: jobPage };
     } else {
-      jobs = response.items || [];
-      jobPage = response.page || 1;
-      jobTotalPages = response.total_pages || 1;
-      meta = response;
+      if (!Array.isArray(response.items)) throw new Error("工作列表回應格式錯誤。");
+      jobs = response.items; jobPage = response.page || 1;
+      jobTotalPages = response.total_pages || 1; meta = response;
     }
+    quickJobItems = jobs;
+    renderVideoJobs(jobs, meta, force);
+    showJobsRefresh("jobRefreshStatus");
+    // Auxiliary options must never hold up generation progress or results.
     if (force || Date.now() - lastJobOptionsLoad > 10000) {
-      try {
-        renderContinuationJobs(await api(H3Web.url("/api/jobs/options")));
-        lastJobOptionsLoad = Date.now();
-      } catch {
-        renderContinuationJobs(jobs);
-      }
+      lastJobOptionsLoad = Date.now();
+      const optionsVersion = ++jobOptionsVersion;
+      api(H3Web.url("/api/jobs/options")).then(options => {
+        if (optionsVersion === jobOptionsVersion) renderContinuationJobs(options);
+      }).catch(() => { if (optionsVersion === jobOptionsVersion) renderContinuationJobs(quickJobItems); });
     }
+  } catch (error) {
+    if (version === jobsRefreshVersion) showJobsRefresh("jobRefreshStatus", error);
+  } finally {
+    if (version === jobsRefreshVersion) jobsRefreshing = false;
+  }
+}
+
+function renderVideoJobs(jobs, meta, force = false) {
     $("#jobPagination").classList.toggle("hidden", jobTotalPages <= 1);
     $("#jobPageLabel").textContent = `第 ${jobPage} / ${jobTotalPages} 頁 · 共 ${meta.total || 0} 筆`;
     $("#previousJobPage").disabled = jobPage <= 1;
@@ -2306,10 +2383,9 @@ async function loadJobs(force = false) {
     const hasActiveJob = jobs.some(job => ["queued", "preparing", "running"].includes(job.status));
     const signature = JSON.stringify({ jobs, meta, activeSecond: hasActiveJob ? Math.floor(Date.now() / 1000) : 0 });
     if (!force && signature === lastJobsSignature) return;
-    if (!force && $$(".job-video").some(video => !video.paused)) return;
     lastJobsSignature = signature;
     $("#jobEmpty").classList.toggle("hidden", jobs.length > 0);
-    $("#jobList").innerHTML = jobs.map(job => {
+    const markup = jobs.map(job => {
       const active = ["queued", "preparing", "running"].includes(job.status);
       const date = new Date(job.created_at).toLocaleString("zh-TW", { hour12: false });
       const fallbackName = `${modeLabels[job.mode] || job.mode} · ${job.width}×${job.height}`;
@@ -2356,12 +2432,10 @@ async function loadJobs(force = false) {
         </details>
       `;
     }).join("");
+    if (updateJobCards($("#jobList"), markup, "jobId")) lastJobsSignature = "";
     $$(".job-card[open] .job-video").forEach(video => {
       if (!video.src) video.src = H3Web.url(video.dataset.src);
     });
-  } catch (error) {
-    console.warn(error);
-  }
 }
 
 function showEngineStarting() {
@@ -2658,9 +2732,8 @@ async function deleteShortFilmProject() {
   toast("短片專案已刪除；已生成影片仍保留。")
 }
 
-async function saveShortFilmProject() {
-  clearTimeout(shortFilmSaveTimer);
-  const project = activeShortFilmProject();
+async function saveShortFilmProject(project = activeShortFilmProject()) {
+  if (project?.id === activeShortFilmId) clearTimeout(shortFilmSaveTimer);
   if (!project) return null;
   const updated = await api(H3Web.url(`/api/shortfilms/${project.id}`), {
     method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(project),
@@ -3070,20 +3143,36 @@ function shortFilmJobContext(project, job) {
 }
 
 async function loadShortFilmJobs(force = false) {
-  const project = activeShortFilmProject();
+  if (shortFilmJobsRefreshing && !force) return;
+  const version = ++shortFilmRefreshVersion, project = activeShortFilmProject();
   const list = $("#shortfilmJobList");
   if (!list) return;
   if (!project) {
+    shortFilmJobsRefreshing = false;
     list.innerHTML = "";
     $("#shortfilmJobEmpty").classList.remove("hidden");
     $("#shortfilmJobPagination").classList.add("hidden");
     return;
   }
-  const query = encodeURIComponent(shortFilmJobSearch);
-  const response = await api(H3Web.url(`/api/shortfilms/${project.id}/jobs?page=${shortFilmJobPage}&page_size=20&q=${query}`));
-  const jobs = response.items || [];
-  shortFilmJobPage = response.page || 1;
-  shortFilmJobTotalPages = response.total_pages || 1;
+  const requestedPage = shortFilmJobPage, requestedSearch = shortFilmJobSearch;
+  shortFilmJobsRefreshing = true;
+  try {
+    const response = await api(H3Web.url(`/api/shortfilms/${project.id}/jobs?page=${requestedPage}&page_size=20&q=${encodeURIComponent(requestedSearch)}`));
+    if (version !== shortFilmRefreshVersion || project.id !== activeShortFilmProject()?.id || requestedPage !== shortFilmJobPage || requestedSearch !== shortFilmJobSearch) return;
+    if (!Array.isArray(response.items)) throw new Error("短片工作列表回應格式錯誤。");
+    shortFilmJobPage = response.page || 1; shortFilmJobTotalPages = response.total_pages || 1;
+    shortFilmJobItems = response.items;
+    renderShortFilmJobs(project, response.items, response, force);
+    showJobsRefresh("shortfilmRefreshStatus");
+  } catch (error) {
+    if (version === shortFilmRefreshVersion) showJobsRefresh("shortfilmRefreshStatus", error);
+  } finally {
+    if (version === shortFilmRefreshVersion) shortFilmJobsRefreshing = false;
+  }
+}
+
+function renderShortFilmJobs(project, jobs, response, force = false) {
+  const list = $("#shortfilmJobList");
   $("#shortfilmJobEmpty").classList.toggle("hidden", jobs.length > 0);
   $("#shortfilmJobPagination").classList.toggle("hidden", shortFilmJobTotalPages <= 1);
   $("#shortfilmJobPageLabel").textContent = `第 ${shortFilmJobPage} / ${shortFilmJobTotalPages} 頁 · 共 ${response.total || 0} 筆`;
@@ -3092,9 +3181,8 @@ async function loadShortFilmJobs(force = false) {
   const hasActiveJob = jobs.some(job => ["queued", "preparing", "running"].includes(job.status));
   const signature = JSON.stringify({ project: project.id, jobs, page: response.page, total: response.total, activeSecond: hasActiveJob ? Math.floor(Date.now() / 1000) : 0 });
   if (!force && signature === lastShortFilmJobsSignature) return;
-  if (!force && $$(".shortfilm-job-video").some(video => !video.paused)) return;
   lastShortFilmJobsSignature = signature;
-  list.innerHTML = jobs.map(job => {
+  const markup = jobs.map(job => {
     const active = ["queued", "preparing", "running"].includes(job.status);
     const context = shortFilmJobContext(project, job);
     const date = new Date(job.created_at).toLocaleString("zh-TW", { hour12: false });
@@ -3133,6 +3221,7 @@ async function loadShortFilmJobs(force = false) {
       </div>
     </details>`;
   }).join("");
+  if (updateJobCards(list, markup, "shortfilmJobId")) lastShortFilmJobsSignature = "";
   $$(".shortfilm-job-card[open] .shortfilm-job-video").forEach(video => {
     if (!video.src) video.src = H3Web.url(video.dataset.src);
   });
@@ -3163,11 +3252,13 @@ async function compileShortFilmShot(shotId, generate = false) {
   const job = await api(H3Web.url("/api/render"), {
     method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(result.payload),
   });
-  const refreshed = findShortFilmShot(shotId);
+  const refreshedProject = shortFilmProjects.find(value => value.id === project.id);
+  const flattened = shortFilmFlatten(refreshedProject);
+  const refreshed = flattened.find(value => value.shot.id === shotId);
+  if (!refreshed) { toast(`工作 ${job.id.slice(0, 8)} 已加入生成佇列。`); loadSharedQueue(); return job; }
   refreshed.shot.job_id = job.id;
   refreshed.shot.status = job.status || "queued";
   refreshed.shot.continuation_asset_id = result.project.scenes.flatMap(scene => scene.shots).find(shot => shot.id === shotId)?.continuation_asset_id || null;
-  const flattened = shortFilmFlatten(activeShortFilmProject());
   const refreshedIndex = flattened.findIndex(item => item.shot.id === shotId);
   for (let index = refreshedIndex + 1; index < flattened.length && flattened[index].shot.continue_previous; index += 1) {
     flattened[index].shot.continuation_asset_id = null;
@@ -3175,12 +3266,18 @@ async function compileShortFilmShot(shotId, generate = false) {
     flattened[index].shot.job_id = null;
     flattened[index].shot.status = "draft";
   }
-  await saveShortFilmProject();
-  renderShortFilmScenes();
-  renderShortFilmSummary();
-  loadJobs(true);
+  if (activeShortFilmProject()?.id === project.id) {
+    renderShortFilmScenes();
+    renderShortFilmSummary();
+    const visible = shortFilmJobPage === 1 && !shortFilmJobSearch ? shortFilmJobItems.filter(item => item.id !== job.id && item.shortfilm_project_id === project.id) : [];
+    shortFilmJobPage = 1; shortFilmJobSearch = ""; $("#shortfilmJobSearch").value = "";
+    shortFilmJobItems = [job, ...visible].slice(0, 20); shortFilmJobTotalPages = 1;
+    renderShortFilmJobs(activeShortFilmProject(), shortFilmJobItems, { page: 1, total: visible.length + 1 }, true);
+  }
+  loadJobs(true); loadSharedQueue();
   loadShortFilmJobs(true).catch(error => console.warn("短片作品載入失敗：", error));
   toast(`${refreshed.scene.title}／${refreshed.shot.title} 已加入生成佇列。`);
+  await saveShortFilmProject(refreshedProject);
   return job;
 }
 
@@ -4459,6 +4556,13 @@ function initialize() {
   checkStatus();
   loadSharedQueue();
   loadJobs(true);
+  const resumeUpdates = () => {
+    if (document.hidden) return;
+    checkStatus(); loadSharedQueue(); loadJobs(true);
+    if (studioWorkspace === "shortfilm") loadShortFilmJobs(true);
+  };
+  document.addEventListener("visibilitychange", resumeUpdates);
+  window.addEventListener("online", resumeUpdates);
   setInterval(loadSharedQueue, 3000);
   setInterval(checkStatus, 10000);
   setInterval(() => loadInstallerStatus().catch(error => console.warn(error)), 2500);

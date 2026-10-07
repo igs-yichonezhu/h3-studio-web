@@ -48,3 +48,8 @@ python -m unittest discover -s tests -p test_web_workers.py -v
 Worker 整合測試包含兩位使用者、真實 Studio 程序、素材上傳、剪輯備份、真實 CPU MP4 匯出和 Range 下載，不執行 GPU 生成。
 
 Chrome 的 HTTPS→HTTP 私有 IP 存取可能需要區域網路權限；公司政策或其他瀏覽器不支援時請提供可信 HTTPS API。參考 https://developer.chrome.com/blog/local-network-access。
+# 生成狀態同步
+
+影片與短片作品每 3 秒、圖片工作每 4 秒自動同步。提交成功立即顯示工作；完成後成果由下一次輪詢顯示。GET 的 15 秒期限包含 JSON 回應，逾時後恢復同步；分頁再次可見或網路恢復時立即更新，保留草稿。播放中的影片卡片維持原播放，其他工作照常更新；暫停後同步延後的卡片變更。
+
+ComfyClient 每 5 秒按經過時間查詢 history，持續 WebSocket 訊息不再延後查詢。本筆工作的結束事件立即核對 history，以完成紀錄判斷成果；history 請求限時 15 秒，既有 prompt 不會重送。更新後請在沒有進行中工作時重新啟動使用者工作程序。部署安裝腳本分別套用 company-backend.patch 與 progress-monitor.patch，可升級已安裝的公司入口。

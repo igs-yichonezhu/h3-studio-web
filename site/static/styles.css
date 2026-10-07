@@ -1034,3 +1034,4 @@ body.ui-ready .studio-grid { animation-delay: 170ms; }
   .model-update-release-heading { flex-direction: column; }
   .model-update-release-heading > div:last-child { text-align: left; }
 }
+.job-refresh-status { color: var(--muted, #6b726c); font-size: 12px; margin: 0 0 12px; }

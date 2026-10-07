@@ -1,0 +1,418 @@
+import asyncio
+import json
+import tempfile
+import unittest
+from collections import Counter
+from pathlib import Path
+from unittest.mock import patch
+
+import aiohttp
+from aiohttp import web
+
+from comfy_client import ComfyClient
+from domain import TURBO_LORA_CANDIDATES, VIDEO_VAE_FILENAMES
+from settings import ConnectionSettings
+
+
+class ComfyClientRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.history_calls = 0
+        self.prompt_calls = 0
+        self.interrupt_calls = 0
+        self.history_complete_after = 3
+        self.history_outcome = "success"
+        self.history_mode = "normal"
+        self.history_release = asyncio.Event()
+        self.ws_mode = "closed"
+        self.ws_event = None
+        self.ws_messages = 0
+        self.ws_ready = asyncio.Event()
+        app = web.Application()
+        app.router.add_post("/prompt", self.prompt)
+        app.router.add_get("/ws", self.websocket)
+        app.router.add_get("/history/{prompt_id}", self.history)
+        app.router.add_post("/interrupt", self.interrupt)
+        app.router.add_post("/api/jobs/{prompt_id}/cancel", self.interrupt)
+        self.runner = web.AppRunner(app)
+        await self.runner.setup()
+        self.site = web.TCPSite(self.runner, "127.0.0.1", 0)
+        await self.site.start()
+        port = self.site._server.sockets[0].getsockname()[1]
+        self.temporary = tempfile.TemporaryDirectory()
+        settings = ConnectionSettings(
+            mode="remote",
+            base_url=f"http://127.0.0.1:{port}",
+            comfy_dir=self.temporary.name,
+            auto_start_local=False,
+        )
+        self.client = ComfyClient(settings, Path(self.temporary.name))
+
+    async def asyncTearDown(self):
+        self.history_release.set()
+        await self.runner.cleanup()
+        self.temporary.cleanup()
+
+    async def prompt(self, _request):
+        self.prompt_calls += 1
+        return web.json_response({"prompt_id": "prompt-1"})
+
+    async def websocket(self, request):
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        self.ws_ready.set()
+        if self.ws_mode != "busy":
+            await ws.close()
+            return ws
+
+        async def broadcast_status():
+            try:
+                if self.ws_event:
+                    await ws.send_json(self.ws_event)
+                while not ws.closed:
+                    await ws.send_json({"type": "status", "data": {"exec_info": {"queue_remaining": 1}}})
+                    self.ws_messages += 1
+                    await asyncio.sleep(0.01)
+            except ConnectionResetError:
+                pass
+
+        sender = asyncio.create_task(broadcast_status())
+        try:
+            # Receive the client's close frame while broadcasts continue.
+            async for _message in ws:
+                pass
+        finally:
+            sender.cancel()
+            await asyncio.gather(sender, return_exceptions=True)
+            await ws.close()
+        return ws
+
+    async def history(self, request):
+        self.history_calls += 1
+        mode = self.history_mode
+        release = self.history_release
+        if mode == "slow_headers":
+            await release.wait()
+        elif mode == "slow_body":
+            response = web.StreamResponse(headers={"Content-Type": "application/json"})
+            await response.prepare(request)
+            await response.write(b'{"prompt-1":')
+            await release.wait()
+            try:
+                await response.write(b'{}}')
+                await response.write_eof()
+            except ConnectionResetError:
+                pass
+            return response
+        if self.history_calls < self.history_complete_after:
+            return web.json_response({})
+        return web.json_response({
+            "prompt-1": {
+                "outputs": {"15": {"images": [{"filename": "done.mp4", "subfolder": "H3Studio", "type": "output"}]}},
+                "status": {"status_str": self.history_outcome, "completed": True,
+                           "messages": [] if self.history_outcome == "success" else [
+                               ["execution_error", {"exception_message": "GPU out of memory"}]
+                           ]},
+            }
+        })
+
+    async def interrupt(self, _request):
+        self.interrupt_calls += 1
+        return web.json_response({"cancelled": True})
+
+    async def ignore_progress(self, _event):
+        pass
+
+    async def test_closed_websocket_reconnects_and_uses_history_result(self):
+        events = []
+
+        async def progress(event):
+            events.append(event)
+
+        prompt_id, history = await asyncio.wait_for(
+            self.client.run_prompt({}, progress, asyncio.Event()),
+            timeout=8,
+        )
+        self.assertEqual(prompt_id, "prompt-1")
+        self.assertEqual(self.client.history_state(history), "success")
+        self.assertGreaterEqual(self.history_calls, 3)
+        self.assertTrue(any("自動重連" in str(event.get("current_node")) for event in events))
+
+    async def test_busy_websocket_cannot_starve_completed_history(self):
+        self.ws_mode = "busy"
+        self.history_complete_after = 2
+        with patch("comfy_client.HISTORY_POLL_INTERVAL", 0.08):
+            prompt_id, history = await asyncio.wait_for(
+                self.client.run_prompt({}, self.ignore_progress, asyncio.Event()), timeout=2,
+            )
+        self.assertEqual(prompt_id, "prompt-1")
+        self.assertEqual(self.client.history_state(history), "success")
+        self.assertGreaterEqual(self.ws_messages, 2)
+        self.assertEqual(self.history_calls, 2)
+        self.assertEqual(self.prompt_calls, 1)
+
+    async def test_matching_terminal_events_check_history_without_waiting_for_poll(self):
+        for event_type in ("execution_success", "executing", "execution_interrupted"):
+            with self.subTest(event_type=event_type):
+                self.ws_mode = "busy"
+                self.ws_event = {"type": event_type, "data": {"prompt_id": "prompt-1", "node": None}}
+                self.history_calls = self.prompt_calls = 0
+                self.history_complete_after = 2
+                with patch("comfy_client.HISTORY_POLL_INTERVAL", 60):
+                    _, history = await asyncio.wait_for(
+                        self.client.run_prompt({}, self.ignore_progress, asyncio.Event()), timeout=2,
+                    )
+                self.assertEqual(self.client.history_state(history), "success")
+                self.assertEqual(self.history_calls, 2)
+                self.assertEqual(self.prompt_calls, 1)
+
+    async def test_success_notification_waits_for_history_to_be_saved(self):
+        self.ws_mode = "busy"
+        self.ws_event = {"type": "execution_success", "data": {"prompt_id": "prompt-1"}}
+        with patch("comfy_client.HISTORY_POLL_INTERVAL", 0.08):
+            _, history = await asyncio.wait_for(
+                self.client.run_prompt({}, self.ignore_progress, asyncio.Event()), timeout=2,
+            )
+        self.assertEqual(self.client.history_state(history), "success")
+        self.assertEqual(self.history_calls, 3)
+        self.assertEqual(self.prompt_calls, 1)
+
+    async def test_success_notification_does_not_override_failed_history(self):
+        self.ws_mode = "busy"
+        self.ws_event = {"type": "execution_success", "data": {"prompt_id": "prompt-1"}}
+        self.history_complete_after = 2
+        self.history_outcome = "error"
+        with patch("comfy_client.HISTORY_POLL_INTERVAL", 60):
+            with self.assertRaisesRegex(RuntimeError, "GPU out of memory"):
+                await asyncio.wait_for(self.client.run_prompt({}, self.ignore_progress, asyncio.Event()), timeout=2)
+        self.assertEqual(self.history_calls, 2)
+        self.assertEqual(self.prompt_calls, 1)
+
+    async def test_other_prompts_terminal_notification_is_ignored_and_cancel_still_interrupts(self):
+        self.ws_mode = "busy"
+        self.ws_event = {"type": "execution_success", "data": {"prompt_id": "someone-elses-prompt"}}
+        self.history_complete_after = 2
+        cancel_event = asyncio.Event()
+        with patch("comfy_client.HISTORY_POLL_INTERVAL", 60):
+            task = asyncio.create_task(self.client.run_prompt({}, self.ignore_progress, cancel_event))
+            try:
+                await asyncio.wait_for(self.ws_ready.wait(), timeout=2)
+                await asyncio.sleep(0.05)
+                self.assertFalse(task.done())
+                self.assertEqual(self.history_calls, 1)
+                cancel_event.set()
+                with self.assertRaises(asyncio.CancelledError):
+                    await asyncio.wait_for(task, timeout=2)
+            finally:
+                if not task.done():
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+        self.assertEqual(self.prompt_calls, 1)
+        self.assertEqual(self.interrupt_calls, 1)
+
+    async def test_history_timeout_covers_headers_and_json_body_with_unbounded_shared_session(self):
+        for mode in ("slow_headers", "slow_body"):
+            with self.subTest(mode=mode):
+                self.history_mode = mode
+                self.history_release = asyncio.Event()
+                try:
+                    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None)) as session:
+                        with patch("comfy_client.HISTORY_REQUEST_TIMEOUT", 0.05):
+                            result = await asyncio.wait_for(self.client.get_history("prompt-1", session), timeout=2)
+                        self.assertEqual(result, {})
+                        self.assertFalse(session.closed)
+                        self.history_mode = "normal"
+                        self.history_complete_after = 1
+                        history = await self.client.get_history("prompt-1", session)
+                        self.assertEqual(self.client.history_state(history), "success")
+                finally:
+                    self.history_release.set()
+
+    def test_history_error_extracts_comfy_exception(self):
+        history = {
+            "status": {
+                "status_str": "error",
+                "completed": True,
+                "messages": [["execution_error", {"exception_message": "GPU out of memory"}]],
+            }
+        }
+        self.assertEqual(self.client.history_state(history), "error")
+        self.assertEqual(self.client.history_error(history), "GPU out of memory")
+
+    def test_decodes_comfy_preview_binary_messages(self):
+        jpeg = b"\xff\xd8preview"
+        decoded = self.client.decode_preview_message((1).to_bytes(4, "big") + (1).to_bytes(4, "big") + jpeg)
+        self.assertEqual(decoded, (jpeg, "image/jpeg"))
+
+        metadata = json.dumps({"image_type": "image/png"}).encode("utf-8")
+        png = b"\x89PNGpreview"
+        decoded = self.client.decode_preview_message(
+            (4).to_bytes(4, "big") + len(metadata).to_bytes(4, "big") + metadata + png
+        )
+        self.assertEqual(decoded, (png, "image/png"))
+
+
+class ComfyClientInventoryTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.stats = {"system": {"comfyui_version": "0.37.0"}}
+        self.stats_status = 200
+        self.stats_invalid_json = False
+        self.requests = Counter()
+        self.authorization = []
+        self.schemas = {
+            "UNETLoader": {"input": {"required": {"unet_name": [[
+                "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+                "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+            ]]}}},
+            "CLIPLoader": {"input": {"required": {"clip_name": [["qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"]]}}},
+            "VAELoader": {"input": {"required": {"vae_name": [["minimax_h3_video_vae_fp16.safetensors", "minimax_h3_audio_vae_fp32.safetensors"]]}}},
+            "LoraLoaderModelOnly": {"input": {"required": {"lora_name": [[candidates[0] for candidates in TURBO_LORA_CANDIDATES.values()]]}}},
+            "H3MemoryOptimization": {"input": {"required": {"model": ["MODEL"]}}},
+            "MiniMaxH3SigmaShift": {"input": {"required": {"model": ["MODEL"]}}},
+            "BlockSparseAttention": {"input": {"required": {"selection": ["COMFY_DYNAMICCOMBO_V3", {"options": [
+                {"key": "sla", "inputs": {"required": {"keep_percent": ["FLOAT", {"default": 10.0}]}}},
+            ]}]}}},
+        }
+        app = web.Application()
+        app.router.add_get("/object_info/{node}", self.object_info)
+        app.router.add_get("/system_stats", self.system_stats)
+        self.runner = web.AppRunner(app)
+        await self.runner.setup()
+        self.site = web.TCPSite(self.runner, "127.0.0.1", 0)
+        await self.site.start()
+        port = self.site._server.sockets[0].getsockname()[1]
+        self.temporary = tempfile.TemporaryDirectory()
+        settings = ConnectionSettings(mode="remote", base_url=f"http://127.0.0.1:{port}",
+                                      comfy_dir=self.temporary.name, auto_start_local=False,
+                                      remote_access_token="inventory-test-token")
+        self.client = ComfyClient(settings, Path(self.temporary.name))
+
+    async def asyncTearDown(self):
+        await self.runner.cleanup()
+        self.temporary.cleanup()
+
+    async def object_info(self, request):
+        node = request.match_info["node"]
+        self.requests[node] += 1
+        self.authorization.append(request.headers.get("Authorization"))
+        # Comfy returns HTTP 200 with an empty object for unknown nodes.
+        return web.json_response({node: self.schemas[node]} if node in self.schemas else {})
+
+    async def system_stats(self, request):
+        self.requests["system_stats"] += 1
+        self.authorization.append(request.headers.get("Authorization"))
+        if self.stats_invalid_json:
+            return web.Response(text="{", content_type="application/json")
+        return web.json_response(self.stats, status=self.stats_status)
+
+    def set_video_vaes(self, *precisions):
+        self.schemas["VAELoader"]["input"]["required"]["vae_name"][0] = [
+            *(VIDEO_VAE_FILENAMES[precision] for precision in precisions),
+            "minimax_h3_audio_vae_fp32.safetensors",
+        ]
+
+    async def test_fp16_only_is_ready_and_loader_schemas_are_fetched_once(self):
+        inventory = await self.client.model_inventory()
+        self.assertTrue(inventory["video_vae"])
+        self.assertTrue(inventory["video_vae_fp16"])
+        self.assertFalse(inventory["video_vae_int8"])
+        self.assertTrue(inventory["video_vae_int8_supported"])
+        self.assertTrue(inventory["audio_vae"])
+        self.assertEqual(self.requests["VAELoader"], 1)
+        self.assertEqual(self.requests["UNETLoader"], 1)
+        self.assertEqual(self.requests["system_stats"], 1)
+        self.assertEqual(set(self.authorization), {"Bearer inventory-test-token"})
+
+    async def test_int8_only_is_ready_on_tested_or_newer_core(self):
+        self.set_video_vaes("int8")
+        for version in ("0.37.0", "v0.37.0", "0.37.0dev+g123abc", "0.37.0.dev1", "0.38.0", "1.0.0"):
+            with self.subTest(version=version):
+                self.stats = {"system": {"comfyui_version": version}}
+                inventory = await self.client.model_inventory(refresh=True)
+                self.assertTrue(inventory["video_vae"])
+                self.assertTrue(inventory["video_vae_int8"])
+                self.assertTrue(inventory["video_vae_int8_supported"])
+                self.assertFalse(inventory["video_vae_fp16"])
+
+    async def test_both_video_vaes_remain_visible(self):
+        self.set_video_vaes("int8", "fp16")
+        inventory = await self.client.model_inventory()
+        self.assertTrue(inventory["video_vae"])
+        self.assertTrue(inventory["video_vae_int8"])
+        self.assertTrue(inventory["video_vae_fp16"])
+        self.assertTrue(inventory["video_vae_int8_supported"])
+
+    async def test_old_or_unknown_core_requires_fp16(self):
+        for version in ("0.36.0", "0.36.9dev+g123abc", "unknown", "0.37", "0.37.0garbage", "", None):
+            with self.subTest(version=version):
+                self.stats = {"system": {"comfyui_version": version}}
+                self.set_video_vaes("int8")
+                inventory = await self.client.model_inventory(refresh=True)
+                self.assertTrue(inventory["video_vae_int8"])
+                self.assertFalse(inventory["video_vae_int8_supported"])
+                self.assertFalse(inventory["video_vae"])
+                self.set_video_vaes("int8", "fp16")
+                inventory = await self.client.model_inventory(refresh=True)
+                self.assertTrue(inventory["video_vae"])
+                self.assertTrue(inventory["video_vae_fp16"])
+                self.assertFalse(inventory["video_vae_int8_supported"])
+
+    async def test_unknown_stats_shape_preserves_fp16_inventory(self):
+        for stats in ({}, {"system": None}, {"system": []}, []):
+            with self.subTest(stats=stats):
+                self.stats = stats
+                inventory = await self.client.model_inventory(refresh=True)
+                self.assertTrue(inventory["video_vae"])
+                self.assertTrue(inventory["video_vae_fp16"])
+                self.assertFalse(inventory["video_vae_int8_supported"])
+
+    async def test_stats_error_preserves_known_inventory(self):
+        for invalid_json in (False, True):
+            with self.subTest(invalid_json=invalid_json):
+                self.stats_status = 503
+                self.stats_invalid_json = invalid_json
+                inventory = await self.client.model_inventory(refresh=True)
+                self.assertTrue(inventory["video_vae"])
+                self.assertTrue(inventory["video_vae_fp16"])
+                self.assertTrue(inventory["audio_vae"])
+                self.assertTrue(inventory["h3_memory_optimization"])
+                self.assertFalse(inventory["video_vae_int8_supported"])
+
+    async def test_inventory_cache_is_defensive_and_refresh_updates_models_and_version(self):
+        inventory = await self.client.model_inventory()
+        calls = self.requests.copy()
+        inventory["video_vae_fp16"] = False
+        self.set_video_vaes("int8")
+        self.stats = {"system": {"comfyui_version": "0.36.0"}}
+        cached = await self.client.model_inventory()
+        self.assertEqual(self.requests, calls)
+        self.assertTrue(cached["video_vae_fp16"])
+        self.assertFalse(cached["video_vae_int8"])
+        self.assertTrue(cached["video_vae_int8_supported"])
+        refreshed = await self.client.model_inventory(refresh=True)
+        self.assertTrue(refreshed["video_vae_int8"])
+        self.assertFalse(refreshed["video_vae_fp16"])
+        self.assertFalse(refreshed["video_vae_int8_supported"])
+        self.assertFalse(refreshed["video_vae"])
+        self.assertEqual(self.requests["VAELoader"], 2)
+        self.assertEqual(self.requests["system_stats"], 2)
+
+    async def test_missing_sparse_node_does_not_hide_independent_memory(self):
+        inventory = await self.client.model_inventory()
+        self.assertTrue(inventory["h3_memory_optimization"])
+        self.assertFalse(inventory["h3_optimizations"])
+        self.assertTrue(inventory["h3_sla_attention"])
+        self.assertTrue(inventory["h3_sigma_shift"])
+        for key in ("fl2v_768_sla", "fl2v_768_audio_v12", "ref2v_768_quality_v10"):
+            self.assertTrue(inventory[f"turbo_{key}"])
+            self.assertEqual(await self.client.resolve_turbo_lora(key), TURBO_LORA_CANDIDATES[key][0])
+
+    async def test_sla_requires_correct_dynamic_schema_not_just_http_200(self):
+        await self.client.model_inventory()
+        self.schemas["BlockSparseAttention"] = {"input": {"required": {"selection": [["sol-attn"]]}}}
+        self.assertFalse((await self.client.model_inventory(refresh=True))["h3_sla_attention"])
+        del self.schemas["H3MemoryOptimization"]
+        self.assertFalse((await self.client.model_inventory(refresh=True))["h3_memory_optimization"])
+
+
+if __name__ == "__main__":
+    unittest.main()

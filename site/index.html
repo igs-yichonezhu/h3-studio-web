@@ -2,11 +2,11 @@
 <html lang="zh-Hant">
 <head>
   <meta name="referrer" content="no-referrer">
-  <link rel="stylesheet" href="./web-client.css?v=acc9cf0a7a105f65">
+  <link rel="stylesheet" href="./web-client.css?v=41418d8854a35397">
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>MiniMax H3 Studio</title>
-  <link rel="stylesheet" href="./static/styles.css?v=20260921-qwen-image">
+  <link rel="stylesheet" href="./static/styles.css?v=20260921-qwen-image&v=41418d8854a35397">
 </head>
 <body class="h3-web-locked">
   <div class="ambient ambient-one"></div>
@@ -389,6 +389,7 @@
         <div><span class="step-number">06</span><h2>生成工作</h2></div>
         <div class="job-toolbar"><input id="jobSearch" type="search" placeholder="搜尋任務名稱或編號"><button id="refreshJobs" class="button ghost small" type="button">重新整理</button></div>
       </div>
+      <p id="jobRefreshStatus" class="job-refresh-status" role="status" aria-live="polite">每 3 秒自動更新工作狀態</p>
       <div id="jobList" class="job-list"></div>
       <div id="jobEmpty" class="empty-state"><span>□</span><strong>還沒有生成工作</strong><p>設定完成後，按下「開始生成影片」。</p></div>
       <div id="jobPagination" class="job-pagination hidden"><button id="previousJobPage" class="button ghost small" type="button">← 上一頁</button><span id="jobPageLabel">第 1 / 1 頁</span><button id="nextJobPage" class="button ghost small" type="button">下一頁 →</button></div>
@@ -506,6 +507,7 @@
             <div><span class="step-number">04</span><div><h2>短片作品</h2><p>只顯示目前短片專案的鏡頭版本，不會混入快速生成作品</p></div></div>
             <div class="job-toolbar"><input id="shortfilmJobSearch" type="search" placeholder="搜尋場次、鏡頭、任務名稱或編號"><button id="refreshShortfilmJobs" class="button ghost small" type="button">重新整理</button></div>
           </div>
+          <p id="shortfilmRefreshStatus" class="job-refresh-status" role="status" aria-live="polite">每 3 秒自動更新工作狀態</p>
           <div id="shortfilmJobList" class="job-list"></div>
           <div id="shortfilmJobEmpty" class="empty-state"><span>□</span><strong>這個短片還沒有生成作品</strong><p>生成任一鏡頭後，影片與歷史版本會集中顯示在這裡。</p></div>
           <div id="shortfilmJobPagination" class="job-pagination hidden"><button id="previousShortfilmJobPage" class="button ghost small" type="button">← 上一頁</button><span id="shortfilmJobPageLabel">第 1 / 1 頁</span><button id="nextShortfilmJobPage" class="button ghost small" type="button">下一頁 →</button></div>
@@ -889,8 +891,8 @@ non_diegetic_music: ...</pre></div>
   </div>
 
 
-  <script id="h3-web-deployment" type="application/json">{"server":"http://192.168.132.34:8795","asset_version":"acc9cf0a7a105f65"}</script>
-  <script id="h3-web-scripts" type="application/json">["./static/app.js?v=20261002-remote-voice","./static/face-repair.js?v=20260917-face-repair"]</script>
-  <script src="./web-client.js?v=acc9cf0a7a105f65"></script>
+  <script id="h3-web-deployment" type="application/json">{"server":"http://192.168.132.34:8795","asset_version":"41418d8854a35397"}</script>
+  <script id="h3-web-scripts" type="application/json">["./static/app.js?v=20261002-remote-voice&v=41418d8854a35397","./static/face-repair.js?v=20260917-face-repair&v=41418d8854a35397"]</script>
+  <script src="./web-client.js?v=41418d8854a35397"></script>
 </body>
 </html>
