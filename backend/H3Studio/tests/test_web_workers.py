@@ -3,6 +3,8 @@ import io
 import tempfile
 import unittest
 import asyncio
+import json
+from unittest.mock import patch
 from pathlib import Path
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
@@ -12,7 +14,8 @@ import av
 import numpy as np
 from fractions import Fraction
 from shared_gateway import GatewayStore
-from web_server import StudioWebServer
+from web_server import StudioWebServer, origin_value
+from web_worker import gateway_session_factory
 
 ORIGIN = "https://yichonezhu.github.io"
 
@@ -127,3 +130,82 @@ class WorkerIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.json("GET", "/api/editor/projects/" + project["id"], alice))["name"], "Alice project")
         # Connection remains read-only and cannot be changed to another user's token.
         self.assertEqual((await self.client.post("/api/connection", headers=alice, json={"mode": "local"})).status, 403)
+
+    async def test_custom_gateways_use_their_own_real_worker_configuration(self):
+        self.broker.remote_auth = self.broker.allow_custom_gateways = True
+        keys = ['h3g_DEMO_GATEWAY_A_ONLY', 'h3g_DEMO_GATEWAY_B_ONLY']
+        targets = []
+        for key in keys:
+            async def handle(request, value=key):
+                if request.headers.get('Authorization') != 'Bearer ' + value:
+                    return web.Response(status=401)
+                if request.path == '/queue':
+                    return web.json_response({'running': [], 'pending': []})
+                if request.path == '/system_stats':
+                    return web.json_response({'system': {}, 'devices': [{'name': value}]})
+                return web.json_response({})
+            app = web.Application()
+            app.router.add_route('*', '/{tail:.*}', handle)
+            gateway = TestServer(app)
+            await gateway.start_server()
+            self.addAsyncCleanup(gateway.close)
+            targets.append(str(gateway.make_url('/')).rstrip('/'))
+        logins = []
+        with patch('web_server.custom_gateway_url', side_effect=origin_value):
+            for key, target in zip(keys, targets):
+                response = await self.client.post('/web/login', headers={'Origin': ORIGIN}, json={'key': key, 'gateway_url': target})
+                self.assertEqual(response.status, 200, await response.text())
+                logins.append(await response.json())
+            response = await self.client.post('/web/login', headers={'Origin': ORIGIN}, json={'key': keys[0], 'gateway_url': targets[1]})
+            self.assertEqual(response.status, 401)
+        self.assertNotEqual(logins[0]['user']['id'], logins[1]['user']['id'])
+        for info, key, target in zip(logins, keys, targets):
+            configuration = json.loads((self.root / 'workers' / info['user']['id'] / 'config.json').read_text())
+            self.assertEqual(configuration['base_url'], target)
+            self.assertEqual(configuration['remote_access_token'], key)
+            headers = {'Origin': ORIGIN, 'Authorization': 'Bearer ' + info['token']}
+            connection = await self.json('GET', '/api/connection', headers)
+            self.assertEqual(connection['base_url'], target)
+        a = {'Origin': ORIGIN, 'Authorization': 'Bearer ' + logins[0]['token']}
+        b = {'Origin': ORIGIN, 'Authorization': 'Bearer ' + logins[1]['token']}
+        project = await self.json('POST', '/api/editor/projects', a, json={'name': 'Gateway A only'})
+        self.assertEqual((await self.client.get('/api/editor/projects/' + project['id'], headers=b)).status, 404)
+        with self.assertRaises(RuntimeError):
+            await self.broker.pool.ensure(logins[0]['user']['id'], keys[0], gateway_url=targets[1])
+
+    async def test_worker_capacity_rejects_new_identity_before_spawning(self):
+        self.broker.pool.max_workers = 1
+        alice = await self.login(self.a_key)
+        response = await self.client.post('/web/login', headers={'Origin': ORIGIN}, json={'key': self.b_key})
+        self.assertEqual(response.status, 503)
+        self.assertEqual(len(self.broker.pool.workers), 1)
+        self.assertFalse((self.root / 'workers' / self.b['id'] / 'config.json').exists())
+        self.assertEqual((await self.client.get('/api/editor/projects', headers=alice)).status, 200)
+
+
+class GatewayTransportTests(unittest.IsolatedAsyncioTestCase):
+    async def test_http_and_websocket_gateway_redirects_never_reach_destination(self):
+        reached = []
+        async def destination(request):
+            reached.append(request.path)
+            return web.Response(text='should not be reached')
+        target = web.Application()
+        target.router.add_route('*', '/{tail:.*}', destination)
+        target_server = TestServer(target)
+        await target_server.start_server()
+        self.addAsyncCleanup(target_server.close)
+        async def redirect(request):
+            return web.Response(status=302, headers={'Location': str(target_server.make_url('/private'))})
+        gateway = web.Application()
+        gateway.router.add_route('*', '/{tail:.*}', redirect)
+        gateway_server = TestServer(gateway)
+        await gateway_server.start_server()
+        self.addAsyncCleanup(gateway_server.close)
+        factory = gateway_session_factory(str(gateway_server.make_url('/')))
+        async with factory() as client:
+            for path in ['/view', '/object_info']:
+                with self.assertRaises(aiohttp.ClientConnectionError):
+                    await client.get(gateway_server.make_url(path))
+            with self.assertRaises(aiohttp.ClientConnectionError):
+                await client.ws_connect(str(gateway_server.make_url('/ws')).replace('http:', 'ws:'))
+        self.assertEqual(reached, [])

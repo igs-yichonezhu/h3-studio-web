@@ -7,11 +7,11 @@ H3 Studio 的 GitHub Pages 網頁介面。公司主機執行完整 Studio API、
 ## 同事使用方式
 
 1. 連上公司內網，開啟網站。
-2. 填入管理者提供的公司 Studio Web 網址（連接埠預設 **8795**）及自己的 `h3g_...` 個人金鑰。
+2. 填入自己的 **GPU Gateway 網址**（共享引擎預設 **8190**），及**該 GPU 電腦核發**的 `h3g_...` 個人金鑰。每台 GPU 可以有不同 IP 與金鑰。
 3. 進入影片生成、圖片工作室或剪輯室。檔案與專案保存在公司主機的個人資料空間。
 4. 共用電腦使用完畢請登出。切換帳號前請先儲存專案並登出。
 
-此網址必須是 Studio Web API，不能填原始 ComfyUI 8188 或共享 Gateway 8190。
+「網頁工作區服務設定」內的 Web 網址由管理者預填（預設 **8795**）。它負責素材、專案與剪輯；GPU Gateway 8190 負責各自的生成引擎。不要把原始 ComfyUI 8188 填入 GPU Gateway 欄位。
 
 ## 公司主機準備
 
@@ -27,6 +27,7 @@ H3 Studio 的 GitHub Pages 網頁介面。公司主機執行完整 Studio API、
 
 - backend/ 亦附啟動與防火牆腳本。
 - 雙擊主機專案根目錄的 `start_h3_web_server.bat`。公司網頁 API 預設為 `http://<公司主機內網IP>:8795`。
+- 同事使用不同 GPU 時，在主機私人 `H3Studio/data/web_server.settings.json` 設定 `remote_auth: true`、`allow_custom_gateways: true` 及預設 `gateway_url`。所有金鑰均向登入時指定的 GPU Gateway 驗證；不同網址＋金鑰有獨立工作區。
 - 使用 DHCP 保留或固定 IP；以管理員 PowerShell 執行 `configure_h3_web_firewall.ps1`。只允許同一子網路的 Domain/Private 網路連入 8795。
 
 若 API 使用可信 HTTPS 憑證，可啟動：
@@ -45,8 +46,8 @@ python H3Studio/web_server.py --cert C:/certs/studio.crt --key C:/certs/studio.k
 
 ## 資料與登入
 
-- 登入前先檢查 Studio Web 健康資訊，並提示誤填 8188／8190；個人長期金鑰只送往填入的公司主機，不寫入瀏覽器儲存，也不送 GitHub。
-- GPU Gateway 在另一台電腦時，以私人 web_server.settings.json 設定 gateway_url 和 remote_auth，詳細設定與金鑰輪替資料移轉方式見 backend/H3Studio/WEB_DEPLOYMENT.md。Web 網址仍使用 Web 主機的 8795。
+- 登入前先檢查 Web 服務相容性；個人金鑰由選定的公司 Web 服務轉交指定的 GPU Gateway，不寫入瀏覽器儲存，也不送 GitHub。瀏覽器與 Web 主機、Web 主機與 GPU Gateway 都需要網路通行。
+- 自訂 GPU Gateway 僅接受 RFC1918 IPv4／fc00::/7 IPv6 內網 IP，拒絕 DNS、loopback、公開 IP、子路徑與轉址。管理者可保留固定 GPU 模式；詳細設定與金鑰輪替資料移轉見 backend/H3Studio/WEB_DEPLOYMENT.md。
 - 瀏覽器分頁保存最長 8 小時的登入 session；登出、金鑰換發或停用即失效。
 - 每位同事有獨立的 Studio 工作程序、素材、生成歷史、圖片、語音與剪輯專案。
 - 圖片、音訊、影片與下載採 30 分鐘的讀取票證，綁定 session、使用者與指定路徑；登入期間自動更新。票證不可執行生成或修改資料。
@@ -54,7 +55,7 @@ python H3Studio/web_server.py --cert C:/certs/studio.crt --key C:/certs/studio.k
 - 瀏覽器草稿依 Repo、公司主機和使用者分開。GitHub Pages 同一帳號的不同 Repo 共用網站 origin，因此該帳號下發布的所有網站都應視為可信。
 - 素材經串流上傳／下載，大檔案不整份載入公司入口 RAM；影片保留 Range seek。
 
-生成工作由共用 GPU 排隊。關閉分頁或登出不會刪除專案；重新登入可繼續。公司主機與服務需要持續開啟。停止公司 API 時會停止它啟動的使用者工作程序；請等進行中的工作完成後再維護。
+生成工作交給各自選擇的 GPU 排隊。同一組 Gateway 網址＋金鑰重新登入可繼續；換 GPU 或金鑰會開啟另一個資料空間。公司 Web 主機與選定的 GPU 服務需要持續開啟。停止公司 API 時會停止它啟動的使用者工作程序；請等進行中的工作完成後再維護。
 
 ## Repo 與發布
 
@@ -64,6 +65,8 @@ python H3Studio/web_server.py --cert C:/certs/studio.crt --key C:/certs/studio.k
 
 首次發布也可在本 Repo 執行 `./publish_github.ps1`：需要先以 `gh auth login` 登入 igs-yichonezhu，腳本會建立公開 Repo、設定 Pages，再推送已提交的 main。此 Repo 的程式碼與介面為公開，個人金鑰、設定與作品僅保存在公司主機。
 
-本版驗證包含 64 項既有 Python 回歸測試、4 項遠端驗證測試與 10 項前端測試，以及瀏覽器 MP4 上傳、跨來源影片載入及專案儲存。使用真實 CPU 剪輯匯出，未執行公司 GPU 生成或跨電腦網路驗收。
+本版驗證包含既有 64 項 Python 回歸測試、19 項 Web 後台測試與 13 項前端測試。不同 Gateway／金鑰驗證與撤銷、真實工作程序的目標設定與專案隔離均已測試。也已驗證瀏覽器 MP4 上傳、跨來源影片載入、專案儲存與 CPU 剪輯匯出；未執行公司 GPU 生成或同事電腦跨機網路驗收。
 
 前端由既有 H3 Studio 介面產生。更新主機專案後執行其 `web_deploy/build.mjs` 重新產生 site/；建置會保留上一份輸出於 Git 忽略的 `.site-previous-*`，避免舊檔混入發布。
+
+建置時可用 `H3_WEB_DEFAULT_SERVER` 與 `H3_WEB_DEFAULT_GATEWAY` 環境變數預填公司 Web 與 GPU 網址。這兩項是公布給同事的服務網址，請勿填入金鑰或含帳密的 URL。

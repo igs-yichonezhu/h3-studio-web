@@ -90,12 +90,36 @@ def route_allowed(method: str, path: str) -> bool:
 
 
 def origin_value(value: str) -> str:
+    if not isinstance(value, str) or any(ord(character) < 32 or ord(character) == 127 for character in value):
+        raise ValueError("Invalid URL characters")
     parsed = urlsplit(value)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
         raise ValueError("Origin must be an http(s) origin")
     if parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
         raise ValueError("Origin must not contain a path")
-    return f"{parsed.scheme}://{parsed.netloc}".rstrip("/")
+    port = parsed.port
+    if port is not None and not 1 <= port <= 65535:
+        raise ValueError("Invalid origin port")
+    host = f"[{parsed.hostname}]" if ':' in parsed.hostname else parsed.hostname
+    suffix = f":{port}" if port and port != {'http': 80, 'https': 443}[parsed.scheme] else ''
+    return f"{parsed.scheme}://{host}{suffix}"
+
+
+def custom_gateway_url(value: str) -> str:
+    """User-selected targets are literal company LAN IPs, never DNS or loopback."""
+    normalized = origin_value(value)
+    parsed = urlsplit(normalized)
+    if '%' in parsed.hostname:
+        raise ValueError("Scoped Gateway IPs are not supported")
+    address = ipaddress.ip_address(parsed.hostname)
+    networks = ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7")
+    if not any(address in ipaddress.ip_network(network) for network in networks):
+        raise ValueError("Gateway must use a company LAN IP")
+    if parsed.port is not None and not 1 <= parsed.port <= 65535:
+        raise ValueError("Invalid Gateway port")
+    host = f"[{address}]" if address.version == 6 else str(address)
+    port = f":{parsed.port}" if parsed.port else ""
+    return f"{parsed.scheme}://{host}{port}"
 
 
 @dataclass
@@ -106,10 +130,11 @@ class Worker:
     ready_file: Path
     secret: str
     fingerprint: str
+    gateway_url: str
 
 
 class WorkerPool:
-    def __init__(self, root: Path, gateway_url: str, *, startup_seconds=45):
+    def __init__(self, root: Path, gateway_url: str, *, startup_seconds=45, max_workers=16):
         self.root = root.resolve()
         parsed = urlsplit(gateway_url)
         if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.query:
@@ -118,13 +143,19 @@ class WorkerPool:
         self.startup_seconds = startup_seconds
         self.workers: dict[str, Worker] = {}
         self.locks = defaultdict(asyncio.Lock)
+        self.start_slots = asyncio.Semaphore(2)
+        self.starting = set()
+        self.max_workers = max_workers
 
-    async def ensure(self, user_id: str, token: str) -> str:
+    async def ensure(self, user_id: str, token: str, *, gateway_url=None) -> str:
         if not USER_ID.fullmatch(user_id):
             raise ValueError("Invalid Gateway identity")
+        target = origin_value(gateway_url or self.gateway_url)
         async with self.locks[user_id]:
             worker = self.workers.get(user_id)
             if worker and worker.process.returncode is None:
+                if worker.gateway_url != target:
+                    raise RuntimeError("Worker Gateway identity mismatch")
                 fingerprint = hashlib.sha256(token.encode()).hexdigest()
                 if hmac.compare_digest(worker.fingerprint, fingerprint):
                     return worker.url
@@ -140,46 +171,57 @@ class WorkerPool:
             if worker:
                 worker.log.close()
                 worker.ready_file.unlink(missing_ok=True)
-            directory = self.root / user_id
-            directory.mkdir(parents=True, exist_ok=True)
-            configuration = directory / "config.json"
-            configuration.write_text(json.dumps({
-                "studio_role": "client", "mode": "remote", "base_url": self.gateway_url,
-                "comfy_dir": str(APP_DIR.parent / "ComfyUI"), "auto_start_local": False,
-                "remote_access_token": token,
-            }), encoding="utf-8")
-            ready = directory / ("worker-" + secrets.token_hex(8) + ".ready.json")
-            secret = secrets.token_urlsafe(32)
-            environment = dict(os.environ, H3_STUDIO_DATA_DIR=str(directory / "data"),
-                               H3_STUDIO_CONFIG_PATH=str(configuration), H3_WORKER_TOKEN=secret, PYTHONUNBUFFERED="1")
-            log = (directory / "worker.log").open("ab")
-            options = {"creationflags": 0x08000000} if os.name == "nt" else {}
-            process = await asyncio.create_subprocess_exec(
-                sys.executable, str(APP_DIR / "web_worker.py"), "--ready-file", str(ready),
-                cwd=str(APP_DIR), env=environment, stdout=log, stderr=log, **options,
-            )
-            try:
-                deadline = time.monotonic() + self.startup_seconds
-                while not ready.exists():
-                    if process.returncode is not None:
-                        raise RuntimeError("Studio worker exited; check its local worker.log")
-                    if time.monotonic() >= deadline:
-                        raise RuntimeError("Studio worker startup timed out")
-                    await asyncio.sleep(0.1)
-                payload = json.loads(ready.read_text(encoding="utf-8"))
-                port = payload["port"]
-                if type(port) is not int or not 1 <= port <= 65535 or payload["pid"] != process.pid:
-                    raise RuntimeError("Invalid worker readiness")
-                url = f"http://127.0.0.1:{port}"
-                self.workers[user_id] = Worker(url, process, log, ready, secret, hashlib.sha256(token.encode()).hexdigest())
-                return url
-            except BaseException:
-                if process.returncode is None:
-                    process.terminate()
-                    await process.wait()
-                log.close()
-                ready.unlink(missing_ok=True)
-                raise
+            async with self.start_slots:
+                active = sum(worker.process.returncode is None for worker in self.workers.values())
+                if active + len(self.starting) >= self.max_workers:
+                    raise RuntimeError("Web worker limit reached")
+                self.starting.add(user_id)
+                try:
+                    return await self.start_worker(user_id, token, target)
+                finally:
+                    self.starting.discard(user_id)
+
+    async def start_worker(self, user_id, token, target):
+        directory = self.root / user_id
+        directory.mkdir(parents=True, exist_ok=True)
+        configuration = directory / "config.json"
+        configuration.write_text(json.dumps({
+            "studio_role": "client", "mode": "remote", "base_url": target,
+            "comfy_dir": str(APP_DIR.parent / "ComfyUI"), "auto_start_local": False,
+            "remote_access_token": token,
+        }), encoding="utf-8")
+        ready = directory / ("worker-" + secrets.token_hex(8) + ".ready.json")
+        secret = secrets.token_urlsafe(32)
+        environment = dict(os.environ, H3_STUDIO_DATA_DIR=str(directory / "data"),
+                           H3_STUDIO_CONFIG_PATH=str(configuration), H3_WORKER_TOKEN=secret, PYTHONUNBUFFERED="1")
+        log = (directory / "worker.log").open("ab")
+        options = {"creationflags": 0x08000000} if os.name == "nt" else {}
+        process = await asyncio.create_subprocess_exec(
+            sys.executable, str(APP_DIR / "web_worker.py"), "--ready-file", str(ready),
+            cwd=str(APP_DIR), env=environment, stdout=log, stderr=log, **options,
+        )
+        try:
+            deadline = time.monotonic() + self.startup_seconds
+            while not ready.exists():
+                if process.returncode is not None:
+                    raise RuntimeError("Studio worker exited; check its local worker.log")
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("Studio worker startup timed out")
+                await asyncio.sleep(0.1)
+            payload = json.loads(ready.read_text(encoding="utf-8"))
+            port = payload["port"]
+            if type(port) is not int or not 1 <= port <= 65535 or payload["pid"] != process.pid:
+                raise RuntimeError("Invalid worker readiness")
+            url = f"http://127.0.0.1:{port}"
+            self.workers[user_id] = Worker(url, process, log, ready, secret, hashlib.sha256(token.encode()).hexdigest(), target)
+            return url
+        except BaseException:
+            if process.returncode is None:
+                process.terminate()
+                await process.wait()
+            log.close()
+            ready.unlink(missing_ok=True)
+            raise
 
     def get(self, user_id: str) -> str | None:
         worker = self.workers.get(user_id)
@@ -209,10 +251,13 @@ class WorkerPool:
 
 class StudioWebServer:
     def __init__(self, gateway_data: Path, worker_root: Path, gateway_url: str, origins,
-                 *, pool=None, session_seconds=SESSION_SECONDS, remote_auth=False):
+                 *, pool=None, session_seconds=SESSION_SECONDS, remote_auth=False, allow_custom_gateways=False):
         self.gateway_data = gateway_data.resolve()
         self.gateway_url = origin_value(gateway_url)
         self.remote_auth = remote_auth
+        if allow_custom_gateways and not remote_auth:
+            raise ValueError("Custom Gateways require remote authentication")
+        self.allow_custom_gateways = allow_custom_gateways
         self.pool = pool or WorkerPool(worker_root, gateway_url)
         self.origins = {origin_value(value) for value in origins}
         self.sessions = {}
@@ -229,10 +274,10 @@ class StudioWebServer:
             return None
         return GatewayStore(self.gateway_data)
 
-    async def remote_key_valid(self, token, *, check_protection=False):
+    async def remote_key_valid(self, token, *, check_protection=False, gateway_url=None):
         if not isinstance(token, str) or not re.fullmatch(r'h3g_[A-Za-z0-9_-]{10,240}', token):
             return False
-        target = self.gateway_url + '/queue'
+        target = (gateway_url or self.gateway_url) + '/queue'
         timeout = aiohttp.ClientTimeout(total=8)
         if check_protection:
             async with self.auth_client.get(target, timeout=timeout, allow_redirects=False) as response:
@@ -265,7 +310,7 @@ class StudioWebServer:
             return False
         if self.remote_auth:
             try:
-                return await self.remote_key_valid(session.get('gateway_token'))
+                return await self.remote_key_valid(session.get('gateway_token'), gateway_url=session['gateway_url'])
             except (aiohttp.ClientError, asyncio.TimeoutError):
                 raise web.HTTPServiceUnavailable(reason='Remote Gateway temporarily unavailable') from None
         store = self.users()
@@ -398,7 +443,9 @@ class StudioWebServer:
         return application
 
     async def health(self, _):
-        return web.json_response({"service": "h3-studio-web", "version": 1})
+        return web.json_response({"service": "h3-studio-web", "version": 2,
+                                  "default_gateway_url": self.gateway_url,
+                                  "allow_custom_gateways": self.allow_custom_gateways})
 
     async def login(self, request):
         if request.headers.get("Origin") not in self.origins:
@@ -417,13 +464,23 @@ class StudioWebServer:
             token = str(payload.get("key", "")).strip()
         except (ValueError, AttributeError):
             return error(400, "請輸入個人金鑰。")
+        gateway_url = self.gateway_url
+        if payload.get('gateway_url'):
+            try:
+                supplied = origin_value(payload['gateway_url'])
+                if supplied != self.gateway_url:
+                    if not self.allow_custom_gateways:
+                        return error(400, '此 Web 服務尚未開放其他 Gateway，請管理者啟用 allow_custom_gateways。')
+                    gateway_url = custom_gateway_url(supplied)
+            except (ValueError, TypeError, AttributeError):
+                return error(400, '請輸入公司內網的 GPU Gateway IP 網址，例如 http://192.168.1.20:8190。')
         if self.remote_auth:
             try:
-                valid = await self.remote_key_valid(token, check_protection=True)
+                valid = await self.remote_key_valid(token, check_protection=True, gateway_url=gateway_url)
             except (aiohttp.ClientError, asyncio.TimeoutError, web.HTTPException):
                 return error(503, '無法驗證遠端 GPU 共享引擎，請確認主機運作與 Gateway 網址。')
             fingerprint = hashlib.sha256(token.encode()).hexdigest()
-            identity = hashlib.sha256(json.dumps([self.gateway_url, token], separators=(',', ':')).encode()).hexdigest()[:16]
+            identity = hashlib.sha256(json.dumps([gateway_url, token], separators=(',', ':')).encode()).hexdigest()[:16]
             user = {'id': identity, 'name': 'GPU 使用者', 'token_hash': fingerprint} if valid else None
         else:
             store = self.users()
@@ -431,7 +488,10 @@ class StudioWebServer:
         if not user:
             return error(401, "個人金鑰無效、已換發或已停用。")
         try:
-            await self.pool.ensure(user["id"], token)
+            if self.allow_custom_gateways:
+                await self.pool.ensure(user["id"], token, gateway_url=gateway_url)
+            else:
+                await self.pool.ensure(user["id"], token)
         except (RuntimeError, OSError):
             return error(503, "Studio 工作程序啟動失敗，請管理者查看本機 worker.log。")
         for digest, session in list(self.sessions.items()):
@@ -445,10 +505,11 @@ class StudioWebServer:
                    "fingerprint": str(user["token_hash"]), "expires": int(now) + self.session_seconds}
         if self.remote_auth:
             session['gateway_token'] = token
+            session['gateway_url'] = gateway_url
         self.sessions[hashlib.sha256(bearer.encode()).hexdigest()] = session
         self.session_ids[session["id"]] = session
         return web.json_response({"token": bearer, "user": {"id": user["id"], "name": user["name"]},
-                                  "expires": session["expires"]})
+                                  "expires": session["expires"], "gateway_url": gateway_url})
 
     async def session(self, request):
         session = await self.bearer_session(request)
@@ -456,7 +517,8 @@ class StudioWebServer:
             return error(401, "登入已失效，請重新輸入個人金鑰。")
         if not self.pool.get(session["user_id"]):
             return error(503, "工作程序已停止，請重新登入。")
-        return web.json_response({"user": {"id": session["user_id"], "name": session["name"]}, "expires": session["expires"]})
+        return web.json_response({"user": {"id": session["user_id"], "name": session["name"]},
+                                  "expires": session["expires"], "gateway_url": session.get('gateway_url', self.gateway_url)})
 
     async def logout(self, request):
         header = request.headers.get('Authorization', '')
@@ -549,6 +611,7 @@ def main():
     parser.add_argument("--gateway-url", default="http://127.0.0.1:8190")
     parser.add_argument('--remote-auth', action='store_true', help='Authenticate personal keys against the configured remote Gateway')
     parser.add_argument('--local-auth', action='store_false', dest='remote_auth', help='Authenticate with this computer GatewayStore')
+    parser.add_argument('--allow-custom-gateways', action='store_true', help='Allow each login to choose its company LAN Gateway IP')
     parser.add_argument('--settings', type=Path, default=APP_DIR / 'data' / 'web_server.settings.json')
     parser.add_argument("--gateway-data", type=Path, default=APP_DIR / "data")
     parser.add_argument("--worker-root", type=Path, default=APP_DIR / "data" / "web_users")
@@ -559,7 +622,7 @@ def main():
     if preview.settings.is_file():
         try:
             settings = json.loads(preview.settings.read_text(encoding='utf-8'))
-            if not isinstance(settings, dict) or set(settings) - {'gateway_url', 'remote_auth', 'origins'}:
+            if not isinstance(settings, dict) or set(settings) - {'gateway_url', 'remote_auth', 'origins', 'allow_custom_gateways'}:
                 raise ValueError('Unknown deployment settings')
             defaults = {}
             if 'gateway_url' in settings:
@@ -570,6 +633,10 @@ def main():
                 if type(settings['remote_auth']) is not bool:
                     raise ValueError('remote_auth must be boolean')
                 defaults['remote_auth'] = settings['remote_auth']
+            if 'allow_custom_gateways' in settings:
+                if type(settings['allow_custom_gateways']) is not bool:
+                    raise ValueError('allow_custom_gateways must be boolean')
+                defaults['allow_custom_gateways'] = settings['allow_custom_gateways']
             if 'origins' in settings:
                 if not isinstance(settings['origins'], list) or not settings['origins']:
                     raise ValueError('origins must be a non-empty list')
@@ -578,6 +645,8 @@ def main():
         except (ValueError, TypeError, AttributeError):
             parser.error('Invalid private deployment settings file')
     arguments = parser.parse_args()
+    if arguments.allow_custom_gateways and not arguments.remote_auth:
+        parser.error('--allow-custom-gateways requires --remote-auth')
     if bool(arguments.cert) != bool(arguments.key):
         parser.error("--cert and --key must be provided together")
     tls = None
@@ -586,7 +655,8 @@ def main():
         tls.minimum_version = ssl.TLSVersion.TLSv1_2
         tls.load_cert_chain(arguments.cert, arguments.key)
     server = StudioWebServer(arguments.gateway_data, arguments.worker_root, arguments.gateway_url,
-                             arguments.origin or ["https://igs-yichonezhu.github.io"], remote_auth=arguments.remote_auth)
+                             arguments.origin or ["https://igs-yichonezhu.github.io"], remote_auth=arguments.remote_auth,
+                             allow_custom_gateways=arguments.allow_custom_gateways)
     print("H3 Studio Web API: company LAN port", arguments.port, flush=True)
     print("Allowed web origins:", ", ".join(sorted(server.origins)), flush=True)
     web.run_app(server.create_app(), host=arguments.host, port=arguments.port,

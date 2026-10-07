@@ -8,13 +8,32 @@ import os
 import hmac
 from pathlib import Path
 
+import aiohttp
 from aiohttp import web
+from yarl import URL
+
+
+def gateway_session_factory(gateway_url, session_factory=None):
+    """Apply redirect protection to every Gateway request in this worker only."""
+    original = session_factory or aiohttp.ClientSession
+    target = URL(gateway_url).origin()
+    async def no_gateway_redirect(_session, _context, params):
+        origin = params.url.with_scheme({'ws': 'http', 'wss': 'https'}.get(params.url.scheme, params.url.scheme)).origin()
+        if origin == target:
+            raise aiohttp.ClientConnectionError('GPU Gateway redirects are not supported')
+    def create(*args, **kwargs):
+        trace = aiohttp.TraceConfig()
+        trace.on_request_redirect.append(no_gateway_redirect)
+        kwargs['trace_configs'] = [*kwargs.get('trace_configs', []), trace]
+        return original(*args, **kwargs)
+    return create
 
 
 async def serve(ready_file: Path) -> None:
     config = json.loads(Path(os.environ["H3_STUDIO_CONFIG_PATH"]).read_text(encoding="utf-8"))
     if config.get("studio_role") != "client" or config.get("mode") != "remote" or config.get("auto_start_local"):
         raise RuntimeError("Web workers require remote client settings.")
+    aiohttp.ClientSession = gateway_session_factory(config['base_url'])
     # Import after the environment and configuration have been prepared.
     from app import create_app
     application = create_app()

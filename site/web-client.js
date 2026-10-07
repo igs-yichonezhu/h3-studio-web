@@ -6,6 +6,9 @@
   const repoRoot = new URL('./', location.href);
   const authKey = `h3-web-auth:${repoRoot.pathname}:v1`;
   const serverKey = `h3-web-server:${repoRoot.pathname}:v1`;
+  const gatewayKey = `h3-web-gateway:${repoRoot.pathname}:v1`;
+  let deployment = {};
+  try { deployment = JSON.parse(document.getElementById('h3-web-deployment')?.textContent || '{}'); } catch {}
   const tickets = new Map();
   let session = null;
   let loaded = false;
@@ -22,6 +25,13 @@
       throw new Error('請輸入完整公司主機網址，例如 http://192.168.1.20:8795。');
     if (['8188', '8190'].includes(url.port))
       throw new Error('這是引擎／共享 Gateway 網址。請使用 Studio Web 主機網址，預設連接埠為 8795。');
+    return url.origin;
+  }
+  function normalizeGateway(value) {
+    const url = new URL(value);
+    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash || !['', '/'].includes(url.pathname))
+      throw new Error('請輸入完整 GPU Gateway 網址，例如 http://192.168.1.20:8190。');
+    if (url.port === '8188') throw new Error('請使用有金鑰保護的共享 Gateway 網址（預設 8190），不是 ComfyUI 8188。');
     return url.origin;
   }
   function readSession() { try { return JSON.parse(window.sessionStorage.getItem(authKey)); } catch { return null; } }
@@ -150,14 +160,20 @@
   const login = document.createElement('section');
   login.id = 'h3-web-login';
   login.setAttribute('aria-label', '連線公司 Studio');
-  login.innerHTML = `<div class="h3-login-shell"><div class="h3-login-story"><div class="h3-login-mark">H3.</div><div class="h3-login-eyebrow">COMPANY STUDIO / WEB ACCESS</div><h1>你的創作工作站</h1><p>在瀏覽器整理想法、生成畫面與剪輯影片。<br>連線公司的 GPU，繼續你的專案。</p><div class="h3-login-route"><span>01 連線公司</span><span>02 驗證金鑰</span><span>03 開始創作</span></div></div><form class="h3-login-form"><h2>連線公司 Studio</h2><p>請使用管理者提供的主機網址與個人金鑰。</p><label for="h3-web-server">公司主機網址</label><input id="h3-web-server" type="url" placeholder="http://192.168.1.20:8795" required autocomplete="off" spellcheck="false"><small class="h3-login-help">請連接公司的 Wi-Fi 或有線網路。</small><label for="h3-web-key">個人金鑰</label><input id="h3-web-key" type="password" placeholder="h3g_…" required autocomplete="off" spellcheck="false"><small class="h3-login-help">金鑰只用於本次驗證。請勿共用個人金鑰。</small><button class="h3-login-submit" type="submit">連線並開啟工作室 →</button><p class="h3-login-status" role="status" aria-live="polite"></p></form></div>`;
+  login.innerHTML = `<div class="h3-login-shell"><div class="h3-login-story"><div class="h3-login-mark">H3.</div><div class="h3-login-eyebrow">COMPANY STUDIO / WEB ACCESS</div><h1>你的創作工作站</h1><p>在瀏覽器整理想法、生成畫面與剪輯影片。<br>選擇你的 GPU，繼續你的專案。</p><div class="h3-login-route"><span>01 選擇 GPU</span><span>02 驗證金鑰</span><span>03 開始創作</span></div></div><form class="h3-login-form"><h2>連線你的 GPU</h2><p>填入 GPU 電腦的共享 Gateway 網址，及那台電腦產生的金鑰。</p><label for="h3-web-gateway">GPU Gateway 網址</label><input id="h3-web-gateway" type="url" placeholder="http://192.168.1.20:8190" autocomplete="off" spellcheck="false"><small class="h3-login-help">每台 GPU 可使用不同網址。請連接公司內網。</small><label for="h3-web-key">個人金鑰</label><input id="h3-web-key" type="password" placeholder="h3g_…" required autocomplete="off" spellcheck="false"><small class="h3-login-help">請使用上方 GPU 電腦核發的金鑰。換 GPU 或金鑰會開啟另一個工作區。</small><details class="h3-login-advanced"><summary>網頁工作區服務設定</summary><label for="h3-web-server">Web 服務網址</label><input id="h3-web-server" type="url" placeholder="http://192.168.1.20:8795" required autocomplete="off" spellcheck="false"><small class="h3-login-help">由管理者設定，負責檔案與專案；不是 GPU Gateway 網址。</small></details><button class="h3-login-submit" type="submit">連線並開啟工作室 →</button><p class="h3-login-status" role="status" aria-live="polite"></p></form></div>`;
   document.body.append(login);
   const form = login.querySelector('form');
   const serverInput = login.querySelector('#h3-web-server');
+  const gatewayInput = login.querySelector('#h3-web-gateway');
   const keyInput = login.querySelector('#h3-web-key');
   const status = login.querySelector('[role="status"]');
-  try { serverInput.value = window.localStorage.getItem(serverKey) || ''; } catch {}
-  serverInput.nextElementSibling.textContent = '請連接公司內網，填入 Studio Web 網址（預設 8795）。共享引擎 8190 和 ComfyUI 8188 無法直接使用。';
+  serverInput.value = deployment.server || '';
+  gatewayInput.value = deployment.gateway_url || '';
+  try {
+    serverInput.value = window.localStorage.getItem(serverKey) || serverInput.value;
+    gatewayInput.value = window.localStorage.getItem(gatewayKey) || gatewayInput.value;
+  } catch {}
+  login.querySelector('details').open = !serverInput.value;
   function showLogin(message = '') {
     document.body.classList.add('h3-web-locked');
     login.hidden = false;
@@ -172,7 +188,7 @@
   async function webAPI(path, options = {}, explicitSession = session) {
     const headers = new Headers(options.headers);
     if (explicitSession?.token) headers.set('Authorization', `Bearer ${explicitSession.token}`);
-    const response = await nativeFetch(explicitSession.server + path, { ...options, headers, credentials: 'omit', mode: 'cors', referrerPolicy: 'no-referrer' });
+    const response = await nativeFetch(explicitSession.server + path, { ...options, headers, credentials: 'omit', mode: 'cors', redirect: 'error', referrerPolicy: 'no-referrer' });
     const data = await response.json();
     if (!response.ok) {
       const error = new Error(data.error || `HTTP ${response.status}`);
@@ -200,7 +216,8 @@
     const identity = document.createElement('div');
     identity.className = 'h3-web-identity';
     const name = document.createElement('span');
-    name.textContent = value.user.name;
+    name.textContent = value.user.name + (value.gateway_url ? ` · ${new URL(value.gateway_url).host}` : '');
+    name.title = value.gateway_url || value.user.name;
     const exit = document.createElement('button');
     exit.textContent = '登出'; exit.type = 'button';
     exit.onclick = async () => {
@@ -215,7 +232,7 @@
     document.addEventListener('click', event => {
       if (event.target.closest('#openConnectionSettings')) {
         event.preventDefault(); event.stopImmediatePropagation();
-        showLogin('更換公司或使用者前，請先儲存目前的剪輯專案。');
+        showLogin('更換 GPU 或金鑰前，請先儲存目前的剪輯專案並登出。');
       }
     }, true);
     const scripts = JSON.parse(document.getElementById('h3-web-scripts').textContent);
@@ -267,17 +284,27 @@
     button.disabled = true; status.textContent = '正在驗證金鑰並開啟你的工作室…';
     try {
       const server = normalizeServer(serverInput.value.trim());
+      let gateway = gatewayInput.value.trim() ? normalizeGateway(gatewayInput.value.trim()) : '';
       // Check the endpoint before transmitting a personal key.
       const health = await webAPI('/web/health', {signal: AbortSignal.timeout(8000)}, {server});
       if (health.service !== 'h3-studio-web')
         throw new Error('指定網址不是 Studio Web 入口。請確認主機網址與連接埠，預設為 8795。');
-      const result = await webAPI('/web/login', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({key: keyInput.value.trim()}) }, {server});
+      if (gateway) {
+        if (typeof health.version !== 'number' || health.version < 2 || typeof health.allow_custom_gateways !== 'boolean' || !health.default_gateway_url)
+          throw new Error('Web 服務版本尚未支援選擇 GPU，請管理者更新後台。');
+        if (gateway !== normalizeGateway(health.default_gateway_url) && !health.allow_custom_gateways)
+          throw new Error('此 Web 服務尚未開放其他 GPU Gateway，請管理者啟用此功能。');
+      } else if (health.default_gateway_url) gateway = normalizeGateway(health.default_gateway_url);
+      const result = await webAPI('/web/login', { method: 'POST', signal: AbortSignal.timeout(60000), headers: {'Content-Type': 'application/json'}, body: JSON.stringify({key: keyInput.value.trim(), ...(gateway ? {gateway_url: gateway} : {})}) }, {server});
       keyInput.value = '';
       if (loaded && session && (server !== session.server || result.user.id !== session.user.id)) {
         await webAPI('/web/logout', {method: 'POST'}, {...result, server}).catch(() => {});
         throw new Error('切換公司或使用者前，請先返回工作室、儲存專案並登出。');
       }
-      try { window.localStorage.setItem(serverKey, server); } catch {}
+      try {
+        window.localStorage.setItem(serverKey, server);
+        if (gateway) window.localStorage.setItem(gatewayKey, gateway);
+      } catch {}
       if (session?.token) await webAPI('/web/logout', {method: 'POST'}).catch(() => {});
       tickets.clear();
       await activate({...result, server});
@@ -294,6 +321,8 @@
     try {
       previous.server = normalizeServer(previous.server);
       const state = await webAPI('/web/session', {}, previous);
+      serverInput.value = previous.server;
+      if (state.gateway_url) gatewayInput.value = state.gateway_url;
       await activate({...previous, ...state});
     } catch (error) {
       if (error.status === 401) window.sessionStorage.removeItem(authKey);
