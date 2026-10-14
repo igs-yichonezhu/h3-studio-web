@@ -215,6 +215,7 @@
   const keyInput = login.querySelector('#h3-web-key');
   const status = login.querySelector('[role="status"]');
   serverInput.value = deployment.server || '';
+  gatewayInput.value = readSession()?.gateway_url || deployment.default_gateway_url || '';
   try {
     serverInput.value = window.localStorage.getItem(serverKey) || serverInput.value;
   } catch {}

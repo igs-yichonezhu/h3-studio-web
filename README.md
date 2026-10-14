@@ -7,7 +7,7 @@ H3 Studio 的 GitHub Pages 網頁介面。公司主機執行完整 Studio API、
 ## 同事使用方式
 
 1. 連上公司內網，開啟網站。
-2. 在空白的 **GPU Gateway 網址**欄位填入自己的共享引擎網址（預設連接埠 **8190**），及**該 GPU 電腦核發**的 `h3g_...` 個人金鑰。每台 GPU 可以有不同 IP 與金鑰；登入頁不預選 GPU，也不沿用上位使用者的 GPU 網址。
+2. **GPU Gateway 網址**預填 `http://192.168.132.64:8190`，可改為自己的共享引擎網址，再輸入**該 GPU 電腦核發**的 `h3g_...` 個人金鑰。每台 GPU 可以有不同 IP 與金鑰；已登入的工作區仍使用原本選擇的 GPU。
 3. 進入影片生成、圖片工作室或剪輯室。檔案與專案保存在公司主機的個人資料空間。
    同一瀏覽器的三個工作室共用一次登入；另開圖片／剪輯分頁會自動驗證既有登入，不必重填金鑰。
 4. 共用電腦使用完畢請登出。切換帳號前請先儲存專案並登出。
@@ -74,4 +74,4 @@ python H3Studio/web_server.py --cert C:/certs/studio.crt --key C:/certs/studio.k
 
 前端由既有 H3 Studio 介面產生。更新主機專案後執行其 `web_deploy/build.mjs` 重新產生 site/；建置會保留上一份輸出於 Git 忽略的 `.site-previous-*`，避免舊檔混入發布。
 
-建置時可用 `H3_WEB_DEFAULT_SERVER` 環境變數預填公司 Web 服務。GPU 網址由每位使用者登入時自行填寫，留空時不會自動選用預設 GPU。請勿在部署資料中填入金鑰或含帳密的 URL。
+建置時可用 `H3_WEB_DEFAULT_SERVER` 環境變數預填公司 Web 服務、`H3_WEB_DEFAULT_GATEWAY` 預填 GPU Gateway。未指定 GPU 預設時欄位留空；使用者可自行修改，既有登入維持原工作區。請勿在部署資料中填入金鑰或含帳密的 URL。
